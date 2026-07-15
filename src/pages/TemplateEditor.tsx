@@ -1414,14 +1414,14 @@ export function TemplateEditor() {
 
   /* ── 加载状态 ── */
   if (loading) return (
-    <div className="h-dvh flex flex-col overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
+    <div className={`h-dvh flex flex-col overflow-hidden${IS_OFFLINE ? ' safe-area-pad' : ''}`} style={{ background: 'var(--bg-primary)' }}>
       {!IS_OFFLINE && <Navbar />}
       <div className="flex-1 flex items-center justify-center" style={{ color: 'var(--text-muted)' }}>加载中...</div>
     </div>
   )
 
   if (error || !template) return (
-    <div className="h-dvh flex flex-col overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
+    <div className={`h-dvh flex flex-col overflow-hidden${IS_OFFLINE ? ' safe-area-pad' : ''}`} style={{ background: 'var(--bg-primary)' }}>
       {!IS_OFFLINE && <Navbar />}
       <div className="flex-1 flex items-center justify-center" style={{ color: 'var(--text-secondary)' }}>
         <div className="text-center">
@@ -1435,7 +1435,7 @@ export function TemplateEditor() {
   )
 
   return (
-    <div className="h-dvh flex flex-col overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
+    <div className={`h-dvh flex flex-col overflow-hidden${IS_OFFLINE ? ' safe-area-pad' : ''}`} style={{ background: 'var(--bg-primary)' }}>
       {!IS_OFFLINE && <Navbar />}
 
       <main className="flex-1 relative z-10 overflow-auto lg:overflow-hidden">

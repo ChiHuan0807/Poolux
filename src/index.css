@@ -27,6 +27,13 @@ input[type="number"] {
 @layer utilities {
   .h-dvh { height: 100dvh; }
   .h-svh { height: 100svh; }
+  /* Capacitor 沉浸：避开刘海 / 底部手势条，内容区不被遮挡 */
+  .safe-area-pad {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+  }
 }
 
 /* ========== CSS 变量 — Poolux 新官网风格 ========== */

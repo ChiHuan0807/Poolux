@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { HashRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { ThemeProvider } from './contexts/ThemeContext'
 import { TemplateEditor } from './pages/TemplateEditor'
+import { setupNativeChrome } from './lib/nativeChrome'
 import './index.css'
 
 /** 离线 APK 入口：仅挂载模板处理页，模板数据来自 ./offline/template.json */
@@ -23,6 +24,9 @@ if ('scrollRestoration' in history) {
   history.scrollRestoration = 'manual'
 }
 window.scrollTo(0, 0)
+
+// 状态栏 / 导航栏沉浸（Capacitor）
+void setupNativeChrome()
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

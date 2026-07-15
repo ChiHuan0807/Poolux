@@ -1,6 +1,7 @@
 /**
- * 导出 PNG：浏览器走 download；Capacitor/Android 写缓存后走系统分享
- *（WebView 里 a.download 通常无效且无反馈）
+ * 导出 PNG：
+ * - 网页：a.download
+ * - Capacitor/Android：直接写入系统相册（非分享面板）
  */
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -16,9 +17,8 @@ function blobToBase64(blob: Blob): Promise<string> {
   })
 }
 
-function isNativeApp(): boolean {
+export function isNativeApp(): boolean {
   try {
-    // 运行时由 Capacitor 注入；未打包进 APK 时走网页逻辑
     const cap = (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor
     return Boolean(cap?.isNativePlatform?.())
   } catch {
@@ -32,43 +32,47 @@ function safeFileName(name: string): string {
 }
 
 export type SaveImageResult = {
-  mode: 'share' | 'download'
+  mode: 'gallery' | 'download'
   message: string
+}
+
+const ALBUM_NAME = 'POOLUX'
+
+/** Android 保存必须指定 albumIdentifier：有则复用，无则创建 */
+async function ensureAlbumIdentifier(Media: {
+  getAlbums: () => Promise<{ albums: { name: string; identifier: string }[] }>
+  createAlbum: (o: { name: string }) => Promise<void>
+}): Promise<string> {
+  const first = await Media.getAlbums()
+  const hit = first.albums.find((a) => a.name === ALBUM_NAME)
+  if (hit?.identifier) return hit.identifier
+
+  await Media.createAlbum({ name: ALBUM_NAME })
+  const second = await Media.getAlbums()
+  const created = second.albums.find((a) => a.name === ALBUM_NAME)
+  if (!created?.identifier) throw new Error('创建相册失败，请检查系统相册权限')
+  return created.identifier
 }
 
 export async function savePngBlob(blob: Blob, filename: string): Promise<SaveImageResult> {
   const fileName = safeFileName(filename)
 
   if (isNativeApp()) {
-    const { Filesystem, Directory } = await import('@capacitor/filesystem')
-    const { Share } = await import('@capacitor/share')
-
+    const { Media } = await import('@capacitor-community/media')
     const base64 = await blobToBase64(blob)
-    const written = await Filesystem.writeFile({
-      path: `poolux-export/${Date.now()}-${fileName}`,
-      data: base64,
-      directory: Directory.Cache,
-      recursive: true,
+    const dataUrl = `data:image/png;base64,${base64}`
+    const albumIdentifier = await ensureAlbumIdentifier(Media)
+    const bareName = fileName.replace(/\.png$/i, '')
+
+    await Media.savePhoto({
+      path: dataUrl,
+      albumIdentifier,
+      fileName: bareName,
     })
 
-    try {
-      await Share.share({
-        title: '保存图片',
-        text: fileName,
-        files: [written.uri],
-        dialogTitle: '保存到相册或分享',
-      })
-      return {
-        mode: 'share',
-        message: '请在系统菜单中选择「保存到相册 / 文件」或分享到微信等',
-      }
-    } catch (err: unknown) {
-      // 用户取消分享不算致命错误
-      const msg = err instanceof Error ? err.message : String(err)
-      if (/cancel|dismiss|abort/i.test(msg)) {
-        return { mode: 'share', message: '已取消分享；可再次点击导出' }
-      }
-      throw err instanceof Error ? err : new Error(msg || '分享失败')
+    return {
+      mode: 'gallery',
+      message: `已保存到相册「${ALBUM_NAME}」`,
     }
   }
 
