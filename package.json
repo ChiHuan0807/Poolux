@@ -12,6 +12,9 @@
     "check": "tsc -b --noEmit"
   },
   "dependencies": {
+    "@capacitor/core": "^6.2.1",
+    "@capacitor/filesystem": "^6.0.4",
+    "@capacitor/share": "^6.0.4",
     "@remixicon/react": "^4.9.0",
     "clsx": "^2.1.1",
     "jszip": "^3.10.1",

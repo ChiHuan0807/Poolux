@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import { Navbar } from '@/components/Navbar'
 import { apiFetch, API_BASE } from '@/lib/api'
 import { IS_OFFLINE, offlineAsset } from '@/lib/offline'
+import { savePngBlob } from '@/lib/saveImage'
 import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssTranslation, resolveTextStyle, stripTranslateTransform } from '@/lib/templateTextStyle'
 import { snapToEdges } from '@/lib/snapToEdges'
 import { ArrowLeft, X, RotateCcw, Download, Palette, Trash2 } from 'lucide-react'
@@ -537,6 +538,7 @@ export function TemplateEditor() {
   const [activeLayerIdx, setActiveLayerIdx] = useState<number | null>(null)
   const [isDragOver, setIsDragOver] = useState(false)
   const [msg, setMsg] = useState('')
+  const [exporting, setExporting] = useState(false)
   // 文字编辑
   const [editingTextIdx, setEditingTextIdx] = useState<number | null>(null)
   const [editedTexts, setEditedTexts] = useDeviceRecordState<string>(selectedDeviceIdx)
@@ -997,9 +999,13 @@ export function TemplateEditor() {
 
   /* ── 导出 ── */
   const handleExport = useCallback(async () => {
-    if (!device) return
+    if (!device || exporting) return
     const hasAnyImage = interactiveLayers.some(({ realIdx }) => layerStates[realIdx]?.imageUrl)
     if (!hasAnyImage) { setMsg('请先上传至少一张图片'); return }
+
+    setExporting(true)
+    setMsg('正在导出…')
+    try {
     console.log('[Export] 设备:', device.width, '×', device.height, ' scale=', previewScale, ' exportScale=', EXPORT_SCALE)
     console.log('[Export] 交互图层:', interactiveLayers.map(({realIdx}) => ({ realIdx, hasImg: !!layerStates[realIdx]?.imageUrl })))
 
@@ -1379,14 +1385,26 @@ export function TemplateEditor() {
       }
     }
 
-    canvas.toBlob((blob) => {
-      if (!blob) return
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url; a.download = `template-${template?.name || 'export'}.png`; a.click()
-      URL.revokeObjectURL(url)
-    }, 'image/png')
-  }, [device, sortedLayers, layerStates, pickedColor, editedTexts, interactiveLayers, template, previewScale])
+      const blob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob((b) => resolve(b), 'image/png')
+      })
+      if (!blob) {
+        setMsg('导出失败：无法生成图片')
+        return
+      }
+      const result = await savePngBlob(
+        blob,
+        `template-${template?.name || 'export'}.png`,
+      )
+      setMsg(result.message)
+    } catch (err: unknown) {
+      const text = err instanceof Error ? err.message : String(err)
+      setMsg(text || '保存失败')
+      console.error('[TemplateEditor] 导出保存失败', err)
+    } finally {
+      setExporting(false)
+    }
+  }, [device, exporting, sortedLayers, layerStates, pickedColor, editedTexts, interactiveLayers, template, previewScale])
 
   const curCursor = dragMode
     ? (dragMode === 'move' ? 'grabbing' : dragMode.startsWith('rotate') ? 'crosshair' : 'nwse-resize')
@@ -1894,11 +1912,12 @@ export function TemplateEditor() {
                 {interactiveLayers.some(({ realIdx }) => layerStates[realIdx]?.imageUrl) && (
                   <button
                     onClick={handleExport}
-                    className="w-full py-2.5 lg:py-3 px-4 font-medium rounded-lg transition-all duration-200 flex items-center justify-center gap-2 text-sm lg:text-base text-white"
+                    disabled={exporting}
+                    className="w-full py-2.5 lg:py-3 px-4 font-medium rounded-lg transition-all duration-200 flex items-center justify-center gap-2 text-sm lg:text-base text-white disabled:opacity-60"
                     style={{ background: 'var(--gradient-accent)', boxShadow: 'var(--shadow-elevated)' }}
                   >
                     <Download className="w-4 h-4" />
-                    导出图片
+                    {exporting ? '导出中…' : '导出图片'}
                   </button>
                 )}
 

@@ -37,7 +37,8 @@ function writeCapacitorConfig() {
 }
 
 function ensureCapacitorPackages() {
-  run('npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 --no-save --no-package-lock')
+  // filesystem/share：APK 内导出图片（WebView 的 a.download 无效）
+  run('npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/filesystem@6 @capacitor/share@6 --no-save --no-package-lock')
 }
 
 function ensureAndroidProject() {
@@ -46,6 +47,48 @@ function ensureAndroidProject() {
   }
   run('npx cap add android')
   run('npx cap sync android')
+}
+
+/** 写入读写媒体权限（选图/旧机保存）；现代 Android 选图也可能走系统 Photo Picker 不弹权限 */
+function patchAndroidManifest() {
+  const manifestPath = join(androidDir, 'app', 'src', 'main', 'AndroidManifest.xml')
+  if (!existsSync(manifestPath)) {
+    console.warn('[gha-apk] 未找到 AndroidManifest.xml')
+    return
+  }
+  let xml = readFileSync(manifestPath, 'utf8')
+  const perms = [
+    'android.permission.READ_MEDIA_IMAGES',
+    'android.permission.READ_MEDIA_VISUAL_USER_SELECTED',
+    'android.permission.READ_EXTERNAL_STORAGE',
+    'android.permission.WRITE_EXTERNAL_STORAGE',
+  ]
+  for (const p of perms) {
+    if (xml.includes(p)) continue
+    const tag =
+      p === 'android.permission.WRITE_EXTERNAL_STORAGE'
+        ? `    <uses-permission android:name="${p}" android:maxSdkVersion="28" />\n`
+        : p === 'android.permission.READ_EXTERNAL_STORAGE'
+          ? `    <uses-permission android:name="${p}" android:maxSdkVersion="32" />\n`
+          : `    <uses-permission android:name="${p}" />\n`
+    if (xml.includes('<application')) {
+      xml = xml.replace('<application', `${tag}<application`)
+    } else {
+      xml = xml.replace('</manifest>', `${tag}</manifest>`)
+    }
+  }
+  // 允许 WebView 内 file input 访问内容（Capacitor 默认通常已够用）
+  if (!xml.includes('android:requestLegacyExternalStorage') && xml.includes('<application')) {
+    xml = xml.replace(
+      /<application\b([^>]*)>/,
+      (m, attrs) => {
+        if (String(attrs).includes('requestLegacyExternalStorage')) return m
+        return `<application${attrs} android:requestLegacyExternalStorage="true">`
+      },
+    )
+  }
+  writeFileSync(manifestPath, xml)
+  console.log('[gha-apk] AndroidManifest 权限已补齐')
 }
 
 function applyIcons() {
@@ -105,6 +148,7 @@ function buildApk() {
 writeCapacitorConfig()
 ensureCapacitorPackages()
 ensureAndroidProject()
+patchAndroidManifest()
 applyIcons()
 patchStrings()
 buildApk()
