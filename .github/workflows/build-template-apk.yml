@@ -1,0 +1,124 @@
+# 由 poolux-api repository_dispatch 触发：编译单模板离线 APK 并回传到服务器
+name: Build Template APK
+
+on:
+  repository_dispatch:
+    types: [build-template-apk]
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: '本地调试用 job id'
+        required: false
+      bundle_url:
+        description: 'bundle tar.gz URL'
+        required: false
+      callback_url:
+        required: false
+      fail_url:
+        required: false
+      callback_token:
+        required: false
+      package_name:
+        required: false
+        default: top.poolux.album.app
+      app_name:
+        required: false
+        default: POOLUX
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      JOB_ID: ${{ github.event.client_payload.job_id || inputs.job_id }}
+      BUNDLE_URL: ${{ github.event.client_payload.bundle_url || inputs.bundle_url }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url }}
+      FAIL_URL: ${{ github.event.client_payload.fail_url || inputs.fail_url }}
+      CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token || inputs.callback_token }}
+      PACKAGE_NAME: ${{ github.event.client_payload.package_name || inputs.package_name || 'top.poolux.album.app' }}
+      APP_NAME: ${{ github.event.client_payload.app_name || inputs.app_name || 'POOLUX' }}
+      BUNDLE_DIR: /tmp/apk-bundle
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Download offline bundle
+        run: |
+          set -euo pipefail
+          if [ -z "${BUNDLE_URL:-}" ]; then
+            echo "缺少 bundle_url"
+            exit 1
+          fi
+          mkdir -p "$BUNDLE_DIR"
+          curl -fL --retry 3 "$BUNDLE_URL" -o /tmp/bundle.tgz
+          tar -xzf /tmp/bundle.tgz -C "$BUNDLE_DIR"
+          ls -la "$BUNDLE_DIR"
+
+      - name: Build offline web
+        run: |
+          set -euo pipefail
+          npx vite build --mode offline
+          mkdir -p dist-offline/offline
+          cp "$BUNDLE_DIR/template.json" dist-offline/offline/
+          cp "$BUNDLE_DIR/fonts.json" dist-offline/offline/
+          if [ -f "$BUNDLE_DIR/meta.json" ]; then cp "$BUNDLE_DIR/meta.json" dist-offline/offline/; fi
+          if [ -d "$BUNDLE_DIR/assets" ]; then cp -a "$BUNDLE_DIR/assets" dist-offline/offline/; fi
+          # Capacitor 默认打开 index.html；把 offline 入口作为主页
+          if [ -f dist-offline/offline.html ]; then
+            cp dist-offline/offline.html dist-offline/index.html
+          fi
+          ls -la dist-offline dist-offline/offline
+
+      - name: Capacitor + Gradle APK
+        env:
+          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          APP_NAME: ${{ env.APP_NAME }}
+          BUNDLE_DIR: ${{ env.BUNDLE_DIR }}
+          WEB_DIR: dist-offline
+        run: node scripts/gha-build-apk.mjs
+
+      - name: Upload APK to server
+        if: success()
+        run: |
+          set -euo pipefail
+          if [ -z "${CALLBACK_URL:-}" ] || [ -z "${CALLBACK_TOKEN:-}" ]; then
+            echo "缺少 callback，跳过上传（本地调试）"
+            exit 0
+          fi
+          curl -fL --retry 3 \
+            -H "X-Callback-Token: ${CALLBACK_TOKEN}" \
+            -F "file=@app-release-local.apk;type=application/vnd.android.package-archive" \
+            "$CALLBACK_URL"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          if [ -n "${FAIL_URL:-}" ] && [ -n "${CALLBACK_TOKEN:-}" ]; then
+            curl -sS -X POST \
+              -H "X-Callback-Token: ${CALLBACK_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"error\":\"GitHub Actions 编译失败 (job=${JOB_ID:-unknown})\"}" \
+              "$FAIL_URL" || true
+          fi

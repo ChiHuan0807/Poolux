@@ -1,0 +1,43 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-offline
+dist-ssr
+android
+capacitor.config.json
+app-release-local.apk
+*.local
+poolux-api/apk-jobs
+poolux-api/data.db
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Backup
+backup/
+backup/source/
+
+# 本地缓存/浏览器产物（会导致 git add 失败，不要提交）
+.edge-final-check/
+.vite/
+.trae/
+
+# 超大字体源包（网站实际用 public/fonts，不必上传 GitHub）
+font/
+*.zip
