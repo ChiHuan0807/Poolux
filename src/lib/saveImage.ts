@@ -1,7 +1,7 @@
 /**
  * 导出 PNG：
  * - 网页：a.download
- * - Capacitor/Android：直接写入系统相册（非分享面板）
+ * - Capacitor/Android：直接写入系统相册（非分享面板），文件名含时间戳防覆盖
  */
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -31,6 +31,14 @@ function safeFileName(name: string): string {
   return base.toLowerCase().endsWith('.png') ? base : `${base}.png`
 }
 
+/** 生成带时间戳的文件名，防止多次导出覆盖 */
+function uniqueFileName(name: string): string {
+  const now = new Date()
+  const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
+  const stem = safeFileName(name).replace(/\.png$/i, '')
+  return `${stem}_${ts}.png`
+}
+
 export type SaveImageResult = {
   mode: 'gallery' | 'download'
   message: string
@@ -38,7 +46,6 @@ export type SaveImageResult = {
 
 const ALBUM_NAME = 'POOLUX'
 
-/** Android 保存必须指定 albumIdentifier：有则复用，无则创建 */
 async function ensureAlbumIdentifier(Media: {
   getAlbums: () => Promise<{ albums: { name: string; identifier: string }[] }>
   createAlbum: (o: { name: string }) => Promise<void>
@@ -55,7 +62,7 @@ async function ensureAlbumIdentifier(Media: {
 }
 
 export async function savePngBlob(blob: Blob, filename: string): Promise<SaveImageResult> {
-  const fileName = safeFileName(filename)
+  const fileName = uniqueFileName(filename)
 
   if (isNativeApp()) {
     const { Media } = await import('@capacitor-community/media')

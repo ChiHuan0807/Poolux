@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import { Navbar } from '@/components/Navbar'
 import { apiFetch, API_BASE } from '@/lib/api'
 import { IS_OFFLINE, offlineAsset } from '@/lib/offline'
-import { savePngBlob } from '@/lib/saveImage'
+import { savePngBlob, isNativeApp } from '@/lib/saveImage'
 import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssTranslation, resolveTextStyle, stripTranslateTransform } from '@/lib/templateTextStyle'
 import { snapToEdges } from '@/lib/snapToEdges'
 import { ArrowLeft, X, RotateCcw, Download, Palette, Trash2 } from 'lucide-react'
@@ -539,6 +539,7 @@ export function TemplateEditor() {
   const [isDragOver, setIsDragOver] = useState(false)
   const [msg, setMsg] = useState('')
   const [exporting, setExporting] = useState(false)
+  const [saveSuccess, setSaveSuccess] = useState(false)
   // 文字编辑
   const [editingTextIdx, setEditingTextIdx] = useState<number | null>(null)
   const [editedTexts, setEditedTexts] = useDeviceRecordState<string>(selectedDeviceIdx)
@@ -1397,6 +1398,10 @@ export function TemplateEditor() {
         `template-${template?.name || 'export'}.png`,
       )
       setMsg(result.message)
+      if (result.mode === 'gallery') {
+        setSaveSuccess(true)
+        setTimeout(() => setSaveSuccess(false), 2000)
+      }
     } catch (err: unknown) {
       const text = err instanceof Error ? err.message : String(err)
       setMsg(text || '保存失败')
@@ -1929,6 +1934,46 @@ export function TemplateEditor() {
           </div>
         </div>
       </main>
+
+      {/* 导出成功弹窗（仅 Android 原生 App） */}
+      {saveSuccess && (
+        <div
+          className="fixed inset-0 flex items-center justify-center"
+          style={{ zIndex: 9998, background: 'rgba(0,0,0,0.35)' }}
+          onClick={() => setSaveSuccess(false)}
+        >
+          <div
+            className="flex flex-col items-center gap-3 px-8 py-6 rounded-2xl shadow-xl"
+            style={{
+              background: 'var(--bg-secondary)',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+              animation: 'fadeInScale 0.25s ease-out',
+              minWidth: 220,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* 成功图标 */}
+            <div
+              className="flex items-center justify-center rounded-full"
+              style={{
+                width: 56, height: 56,
+                background: 'linear-gradient(135deg, #34d399, #10b981)',
+                boxShadow: '0 4px 12px rgba(16,185,129,0.3)',
+              }}
+            >
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </div>
+            <div style={{ fontWeight: 600, fontSize: 16, color: 'var(--text-primary)' }}>
+              保存成功
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.4 }}>
+              已保存到相册「POOLUX」
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

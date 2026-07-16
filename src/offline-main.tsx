@@ -1,9 +1,10 @@
-import { StrictMode } from 'react'
+import { useState, useCallback } from 'react'
 import { createRoot } from 'react-dom/client'
 import { HashRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { ThemeProvider } from './contexts/ThemeContext'
 import { TemplateEditor } from './pages/TemplateEditor'
 import { setupNativeChrome } from './lib/nativeChrome'
+import { SplashScreen } from './components/SplashScreen'
 import './index.css'
 
 /** 离线 APK 入口：仅挂载模板处理页，模板数据来自 ./offline/template.json */
@@ -28,8 +29,16 @@ window.scrollTo(0, 0)
 // 状态栏 / 导航栏沉浸（Capacitor）
 void setupNativeChrome()
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <OfflineApp />
-  </StrictMode>,
-)
+/** 启动页 + 主应用 */
+function AppWithSplash() {
+  const [showSplash, setShowSplash] = useState(true)
+  const handleDone = useCallback(() => setShowSplash(false), [])
+  return (
+    <>
+      {showSplash && <SplashScreen onDone={handleDone} />}
+      <OfflineApp />
+    </>
+  )
+}
+
+createRoot(document.getElementById('root')!).render(<AppWithSplash />)
