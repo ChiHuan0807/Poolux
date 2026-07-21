@@ -8,7 +8,6 @@ const Home = lazy(() => import("@/pages/Home").then(m => ({ default: m.Home })))
 const WatchFaceHome = lazy(() => import("@/pages/WatchFaceHome").then(m => ({ default: m.WatchFaceHome })));
 const WatchFaceEdit = lazy(() => import("@/pages/WatchFaceEdit").then(m => ({ default: m.WatchFaceEdit })));
 const WatchFaceEditShiYu = lazy(() => import("@/pages/WatchFaceEditShiYu").then(m => ({ default: m.WatchFaceEditShiYu })));
-const WatchFaceEditLayerUI = lazy(() => import("@/pages/WatchFaceEditLayerUI").then(m => ({ default: m.WatchFaceEditLayerUI })));
 const TemplateEditor = lazy(() => import("@/pages/TemplateEditor").then(m => ({ default: m.TemplateEditor })));
 const Terms = lazy(() => import("@/pages/Terms").then(m => ({ default: m.Terms })));
 const Resources = lazy(() => import("@/pages/Resources").then(m => ({ default: m.Resources })));
@@ -81,11 +80,6 @@ function AnimatedRoutes() {
         <Route path="/tools/watch-face/edit-shiyu" element={
           <Suspense fallback={<PageFallback />}>
             <WatchFaceEditShiYu />
-          </Suspense>
-        } />
-        <Route path="/tools/watch-face/edit-layerui" element={
-          <Suspense fallback={<PageFallback />}>
-            <WatchFaceEditLayerUI />
           </Suspense>
         } />
         <Route path="/tools/watch-face/edit-template/:id" element={

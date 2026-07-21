@@ -24,7 +24,12 @@ function copyDir(src, dest) {
       mkdirSync(destPath, { recursive: true })
       copyDir(srcPath, destPath)
     } else {
-      cpSync(srcPath, destPath)
+      try {
+        cpSync(srcPath, destPath)
+      } catch (err) {
+        // Windows 上 cpSync 可能因隐藏文件属性失败，跳过
+        console.warn(`[copy-api] 跳过 ${f}: ${err.message}`)
+      }
     }
   }
 }

@@ -821,11 +821,34 @@ type ApkJob = {
 
 const APK_BUSY = new Set(['queued', 'preparing', 'building'])
 
+/** finished_at 为后端写入的中国大陆墙钟时间（无时区后缀），禁止再用 Date 当 UTC/本地二次换算 */
+function formatApkFinishedAt(value?: string) {
+  if (!value) return ''
+  const match = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/)
+  if (match) return `${match[2]}/${match[3]} ${match[4]}:${match[5]}`
+  // 兼容旧数据：带 Z / 偏移的 ISO 统一按上海时区展示
+  const parsed = new Date(value)
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toLocaleString('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+  }
+  return value
+}
+
 function apkStatusLabel(job?: ApkJob | null) {
   if (!job) return ''
   if (job.status === 'preparing') return '准备资源中…'
   if (job.status === 'building' || job.status === 'queued') return 'GitHub Actions 编译中…'
-  if (job.status === 'ready') return '可下载'
+  if (job.status === 'ready') {
+    const time = formatApkFinishedAt(job.finished_at)
+    return '可下载' + (time ? ` (${time})` : '')
+  }
   if (job.status === 'failed') return job.error ? `失败：${job.error}` : '打包失败'
   return job.status
 }

@@ -173,11 +173,22 @@ type WorkImage = {
 const repeatToLength = (images: string[], minimum: number) =>
   Array.from({ length: Math.max(minimum, images.length) }, (_, index) => images[index % images.length])
 
+/** Fisher-Yates shuffle，每次进入页面随机打乱图片顺序 */
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
+
 function WorksWall({ images }: { images: string[] }) {
   const wallRef = useRef<HTMLDivElement>(null)
   const rowRefs = useRef<Array<HTMLDivElement | null>>([])
   const rows = useMemo(() => {
-    const repeated = repeatToLength(images, 18)
+    const shuffled = shuffle(images)
+    const repeated = repeatToLength(shuffled, 18)
     return [repeated, [...repeated].reverse(), repeated]
   }, [images])
 

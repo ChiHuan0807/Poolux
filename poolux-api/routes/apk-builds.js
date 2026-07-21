@@ -28,6 +28,20 @@ const PUBLIC_DARK_SVG = [
   join(__dirname, '..', 'assets', 'dark.svg'),
 ].find((p) => existsSync(p))
 
+/** 中国大陆墙钟时间（Asia/Shanghai），格式 YYYY-MM-DD HH:mm:ss，避免 UTC ISO 被前端当本地时间误读 */
+function formatChinaDateTime(date = new Date()) {
+  return new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date).replace('T', ' ')
+}
+
 mkdirSync(JOBS_DIR, { recursive: true })
 
 const apkUpload = multer({
@@ -178,7 +192,7 @@ async function prepareBundle(jobId, template) {
     template_id: template.id,
     template_name: template.name,
     package_name: packageNameFor(template.id),
-    generated_at: new Date().toISOString(),
+    generated_at: formatChinaDateTime(),
   }, null, 2))
 
   // 图标：dark.svg → png（APK 启动图标）
@@ -196,7 +210,13 @@ async function triggerGithubActions(payload) {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
   const repo = process.env.GITHUB_REPO // owner/name
   if (!token || !repo) {
-    throw new Error('未配置 GITHUB_TOKEN / GITHUB_REPO，无法触发 Actions 编译')
+    const missing = [
+      !token ? 'GITHUB_TOKEN（或 GH_TOKEN）' : null,
+      !repo ? 'GITHUB_REPO' : null,
+    ].filter(Boolean).join('、')
+    throw new Error(
+      `未配置 ${missing}，无法触发 Actions 编译。请写入 poolux-api/.env 后重启 API（见 .env.example）`,
+    )
   }
   const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
     method: 'POST',
@@ -271,7 +291,7 @@ router.post('/', authMiddleware, async (req, res) => {
         updateApkBuild(id, {
           status: 'failed',
           error: err.message || String(err),
-          finished_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+          finished_at: formatChinaDateTime(),
         })
       }
     })()
@@ -344,7 +364,7 @@ router.post('/:id/complete', apkUpload.single('file'), (req, res) => {
     status: 'ready',
     apk_filename: finalName,
     error: '',
-    finished_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    finished_at: formatChinaDateTime(),
   })
   res.json({ ok: true })
 })
@@ -360,7 +380,7 @@ router.post('/:id/fail', (req, res) => {
   updateApkBuild(job.id, {
     status: 'failed',
     error: req.body?.error || 'GitHub Actions 编译失败',
-    finished_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    finished_at: formatChinaDateTime(),
   })
   res.json({ ok: true })
 })

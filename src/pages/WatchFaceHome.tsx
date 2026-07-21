@@ -167,7 +167,6 @@ function TemplateThumbnail({ template, size = 80 }: { template: Template; size?:
 const BUILTIN_CARDS = [
   { label: '「Canopy UI」', sub: '相册表盘', path: '/tools/watch-face/edit' },
   { label: '「时语」', sub: '相册表盘', path: '/tools/watch-face/edit-shiyu' },
-  { label: '「Layer UI」', sub: '相册表盘', path: '/tools/watch-face/edit-layerui' },
 ]
 
 export function WatchFaceHome() {

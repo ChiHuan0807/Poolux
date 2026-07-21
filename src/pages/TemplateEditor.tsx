@@ -4,7 +4,7 @@ import { Navbar } from '@/components/Navbar'
 import { apiFetch, API_BASE } from '@/lib/api'
 import { IS_OFFLINE, offlineAsset } from '@/lib/offline'
 import { savePngBlob, isNativeApp } from '@/lib/saveImage'
-import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssTranslation, resolveTextStyle, stripTranslateTransform } from '@/lib/templateTextStyle'
+import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssRotation, resolveCssTranslation, resolveTextStyle, stripTranslateTransform } from '@/lib/templateTextStyle'
 import { snapToEdges } from '@/lib/snapToEdges'
 import { ArrowLeft, X, RotateCcw, Download, Palette, Trash2 } from 'lucide-react'
 
@@ -37,6 +37,7 @@ interface Layer {
   effects?: { opacity: number; blur_type: 'none' | 'gaussian' | 'backdrop'; blur_value: number }
   visible_in_export?: boolean
   adjustments?: { rotation?: number; scale?: number; blur?: number; contrast?: number; brightness?: number }
+  group_id?: string
 }
 
 interface DeviceConfig {
@@ -130,6 +131,23 @@ function parseCssBlock(raw: string): Record<string, string> {
   return parseCssDeclarations(raw)
 }
 
+/** 绕过浏览器 CSSOM，直接从原始 CSS 字符串拆分属性。
+ *  用于兜底 CSSOM 在不同浏览器中解析
+ *  background/border 缩写行为不一致导致渐变/边框丢失的问题。 */
+function getRawCssProps(raw: string): Record<string, string> {
+  const props: Record<string, string> = {}
+  if (!raw) return props
+  const cleaned = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[^{]*\{|\}[^}]*$/g, '').trim()
+  for (const decl of cleaned.split(';')) {
+    const idx = decl.indexOf(':')
+    if (idx < 0) continue
+    const prop = decl.slice(0, idx).trim().toLowerCase()
+    const value = decl.slice(idx + 1).trim()
+    if (prop && value) props[prop] = value
+  }
+  return props
+}
+
 /** 解析图层在设备坐标系中的最终视觉矩形。结构化宽高和 x/y 是 CSS 缺失时的回退。 */
 function resolveLayerRect(
   layer: Pick<Layer, 'type' | 'x' | 'y' | 'css_width' | 'css_height'>,
@@ -168,6 +186,8 @@ function getLayerBoxStyle(layer: Layer, css: Record<string, string>, deviceW: nu
     'insetBlockStart', 'insetBlockEnd', 'insetInlineStart', 'insetInlineEnd',
   ]) delete style[property]
   return {
+    // 结构化层级作为默认值；CSS 中显式 z-index 仍可覆盖，行为与管理端预览一致。
+    zIndex: layer.z_index ?? 0,
     ...style,
     left: rect.left,
     top: rect.top,
@@ -267,6 +287,85 @@ function resolveImageFilter(layer: Layer, exportScale = 1): string | undefined {
     filters.push(`blur(${layer.effects.blur_value * exportScale}px)`)
   }
   return filters.join(' ') || undefined
+}
+
+/** Android WebView 的 CanvasRenderingContext2D.filter 可能静默失效；用软件像素处理保留导出滤镜。 */
+function renderSoftwareFilteredImage(
+  image: CanvasImageSource,
+  width: number,
+  height: number,
+  layer: Layer,
+  exportScale: number,
+): HTMLCanvasElement | CanvasImageSource {
+  const adjustments = layer.adjustments
+  const blurValue = Math.max(
+    adjustments?.blur || 0,
+    layer.effects?.blur_type === 'gaussian' ? layer.effects.blur_value : 0,
+  ) * exportScale
+  const contrast = adjustments?.contrast ?? 100
+  const brightness = adjustments?.brightness ?? 100
+  if (blurValue <= 0 && contrast === 100 && brightness === 100) return image
+
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.ceil(width))
+  canvas.height = Math.max(1, Math.ceil(height))
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return image
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
+
+  let pixels: ImageData
+  try {
+    pixels = ctx.getImageData(0, 0, canvas.width, canvas.height)
+  } catch {
+    return image
+  }
+
+  // 分离的水平/垂直 box blur，近似 Gaussian blur，避免 Android Canvas filter 的兼容性问题。
+  const radius = Math.min(64, Math.max(1, Math.round(blurValue)))
+  if (blurValue > 0) {
+    const source = pixels.data
+    const horizontal = new Uint8ClampedArray(source.length)
+    const windowSize = radius * 2 + 1
+    for (let y = 0; y < canvas.height; y++) {
+      const row = y * canvas.width * 4
+      for (let channel = 0; channel < 4; channel++) {
+        let sum = 0
+        for (let x = -radius; x <= radius; x++) sum += source[row + Math.min(canvas.width - 1, Math.max(0, x)) * 4 + channel]
+        for (let x = 0; x < canvas.width; x++) {
+          horizontal[row + x * 4 + channel] = sum / windowSize
+          const removeX = Math.min(canvas.width - 1, Math.max(0, x - radius))
+          const addX = Math.min(canvas.width - 1, Math.max(0, x + radius + 1))
+          sum += source[row + addX * 4 + channel] - source[row + removeX * 4 + channel]
+        }
+      }
+    }
+    for (let x = 0; x < canvas.width; x++) {
+      for (let channel = 0; channel < 4; channel++) {
+        let sum = 0
+        for (let y = -radius; y <= radius; y++) sum += horizontal[Math.min(canvas.height - 1, Math.max(0, y)) * canvas.width * 4 + x * 4 + channel]
+        for (let y = 0; y < canvas.height; y++) {
+          pixels.data[y * canvas.width * 4 + x * 4 + channel] = sum / windowSize
+          const removeY = Math.min(canvas.height - 1, Math.max(0, y - radius))
+          const addY = Math.min(canvas.height - 1, Math.max(0, y + radius + 1))
+          sum += horizontal[addY * canvas.width * 4 + x * 4 + channel] - horizontal[removeY * canvas.width * 4 + x * 4 + channel]
+        }
+      }
+    }
+  }
+
+  if (contrast !== 100 || brightness !== 100) {
+    const contrastFactor = contrast / 100
+    const brightnessFactor = brightness / 100
+    for (let i = 0; i < pixels.data.length; i += 4) {
+      for (let channel = 0; channel < 3; channel++) {
+        pixels.data[i + channel] = Math.max(0, Math.min(255,
+          ((pixels.data[i + channel] - 128) * contrastFactor + 128) * brightnessFactor,
+        ))
+      }
+    }
+  }
+  ctx.putImageData(pixels, 0, 0)
+  return canvas
 }
 
 interface ParsedBoxShadow {
@@ -426,6 +525,136 @@ function cssToProps(css: Record<string, string>): React.CSSProperties {
   return style as React.CSSProperties
 }
 
+/** 仅在 CSS 函数最外层拆分参数，避免 rgba()/calc() 内部逗号破坏渐变色标。 */
+function splitTopLevelCssArgs(value: string): string[] {
+  const parts: string[] = []
+  let start = 0
+  let depth = 0
+  let quote = ''
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index]
+    if (quote) {
+      if (char === quote && value[index - 1] !== '\\') quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") { quote = char; continue }
+    if (char === '(') depth++
+    else if (char === ')') depth = Math.max(0, depth - 1)
+    else if (char === ',' && depth === 0) {
+      parts.push(value.slice(start, index).trim())
+      start = index + 1
+    }
+  }
+  parts.push(value.slice(start).trim())
+  return parts.filter(Boolean)
+}
+
+function parseGradientStop(value: string): { color: string; offset?: number } {
+  let depth = 0
+  let quote = ''
+  let splitAt = -1
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index]
+    if (quote) {
+      if (char === quote && value[index - 1] !== '\\') quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") { quote = char; continue }
+    if (char === '(') depth++
+    else if (char === ')') depth = Math.max(0, depth - 1)
+    else if (/\s/.test(char) && depth === 0) splitAt = index
+  }
+
+  if (splitAt >= 0) {
+    const offsetText = value.slice(splitAt).trim()
+    if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(offsetText)) {
+      return {
+        color: value.slice(0, splitAt).trim(),
+        offset: Math.min(1, Math.max(0, Number.parseFloat(offsetText) / 100)),
+      }
+    }
+  }
+  return { color: value.trim() }
+}
+
+function resolveGradientOffsets(stops: { color: string; offset?: number }[]) {
+  const resolved = stops.map(stop => ({ ...stop }))
+  if (resolved.length === 0) return resolved as { color: string; offset: number }[]
+  resolved[0].offset ??= 0
+  resolved[resolved.length - 1].offset ??= 1
+
+  let anchor = 0
+  while (anchor < resolved.length - 1) {
+    let next = anchor + 1
+    while (next < resolved.length && resolved[next].offset == null) next++
+    const startOffset = resolved[anchor].offset ?? 0
+    const endOffset = resolved[next]?.offset ?? startOffset
+    const distance = next - anchor
+    for (let index = anchor + 1; index < next; index++) {
+      resolved[index].offset = startOffset + (endOffset - startOffset) * ((index - anchor) / distance)
+    }
+    anchor = next
+  }
+  return resolved as { color: string; offset: number }[]
+}
+
+function gradientAngleToDegrees(value: string): number | null {
+  const normalized = value.trim().toLowerCase()
+  const numeric = Number.parseFloat(normalized)
+  if (normalized.endsWith('deg') && Number.isFinite(numeric)) return numeric
+  if (normalized.endsWith('turn') && Number.isFinite(numeric)) return numeric * 360
+  if (normalized.endsWith('rad') && Number.isFinite(numeric)) return numeric * 180 / Math.PI
+  const directions: Record<string, number> = {
+    'to top': 0,
+    'to top right': 45,
+    'to right top': 45,
+    'to right': 90,
+    'to bottom right': 135,
+    'to right bottom': 135,
+    'to bottom': 180,
+    'to bottom left': 225,
+    'to left bottom': 225,
+    'to left': 270,
+    'to top left': 315,
+    'to left top': 315,
+  }
+  return directions[normalized] ?? null
+}
+
+function createCanvasLinearGradient(
+  ctx: CanvasRenderingContext2D,
+  value: string,
+  box: { left: number; top: number; width: number; height: number },
+): CanvasGradient | null {
+  const match = value.trim().match(/^linear-gradient\(([\s\S]*)\)$/i)
+  if (!match) return null
+  const args = splitTopLevelCssArgs(match[1])
+  if (args.length < 2) return null
+
+  const parsedAngle = gradientAngleToDegrees(args[0])
+  const angle = parsedAngle ?? 180
+  const stopArgs = parsedAngle == null ? args : args.slice(1)
+  const stops = resolveGradientOffsets(stopArgs.map(parseGradientStop))
+  if (stops.length < 2 || stops.some(stop => !stop.color)) return null
+
+  const angleRad = (angle - 90) * Math.PI / 180
+  const centerX = box.left + box.width / 2
+  const centerY = box.top + box.height / 2
+  const halfProjection = (Math.abs(box.width * Math.cos(angleRad)) + Math.abs(box.height * Math.sin(angleRad))) / 2
+  const x1 = centerX - Math.cos(angleRad) * halfProjection
+  const y1 = centerY - Math.sin(angleRad) * halfProjection
+  const x2 = centerX + Math.cos(angleRad) * halfProjection
+  const y2 = centerY + Math.sin(angleRad) * halfProjection
+  const gradient = ctx.createLinearGradient(x1, y1, x2, y2)
+
+  try {
+    stops.forEach(stop => gradient.addColorStop(stop.offset, stop.color))
+    return gradient
+  } catch {
+    return null
+  }
+}
+
 function migrateLayer(l: any, i: number): Layer {
   const migrated = { ...l, show_on_client: l.show_on_client ?? true }
   if (l.css_shape && !l.css_code) {
@@ -536,10 +765,20 @@ export function TemplateEditor() {
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
   const [dragStartState, setDragStartState] = useState({ x: 0, y: 0, scale: 1, rotation: 0 })
   const [activeLayerIdx, setActiveLayerIdx] = useState<number | null>(null)
+  const groupDragRef = useRef<{ gid: string; members: { realIdx: number; startX: number; startY: number }[] } | null>(null)
   const [isDragOver, setIsDragOver] = useState(false)
   const [msg, setMsg] = useState('')
   const [exporting, setExporting] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(false)
+  // backdrop-filter 在 Android/HyperOS WebView 上可能声明支持但输出黑色离屏纹理。
+  // 首帧先关闭，确认是非 Android 且 API 支持后再启用，避免一次错误合成污染图层。
+  const [backdropFilterOk, setBackdropFilterOk] = useState(false)
+  useEffect(() => {
+    const isAndroidRuntime = /android/i.test(navigator.userAgent)
+    const supportsBackdrop = typeof CSS !== 'undefined' && Boolean(CSS.supports)
+      && (CSS.supports('backdrop-filter', 'blur(1px)') || CSS.supports('-webkit-backdrop-filter', 'blur(1px)'))
+    setBackdropFilterOk(!isAndroidRuntime && supportsBackdrop)
+  }, [])
   // 文字编辑
   const [editingTextIdx, setEditingTextIdx] = useState<number | null>(null)
   const [editedTexts, setEditedTexts] = useDeviceRecordState<string>(selectedDeviceIdx)
@@ -735,46 +974,67 @@ export function TemplateEditor() {
     }
   }, [device, getImageDisplay, vpLeft, vpTop, previewWidth, previewHeight, previewScale])
 
-  /* ── 文件上传 ── */
+  /** 同组上传图层共享一个图片状态；未分组时只返回当前图层。 */
+  const getSharedUploadLayerIndexes = useCallback((layerIdx: number): number[] => {
+    const layer = device?.layers[layerIdx]
+    const groupId = layer?.group_id?.trim()
+    if (!groupId) return [layerIdx]
+    const indexes = interactiveLayers
+      .filter(({ layer: candidate }) => candidate.group_id?.trim() === groupId)
+      .map(({ realIdx }) => realIdx)
+    return indexes.length > 0 ? indexes : [layerIdx]
+  }, [device, interactiveLayers])
+
+  /* ── 文件上传（同组图层共享同一张图片） ── */
   const handleFileUpload = useCallback((layerIdx: number, file: File) => {
     if (!file.type.startsWith('image/')) return
     const url = URL.createObjectURL(file)
-    // 同一张用户图片生成一组色板；所有标记为 picker 的视觉图层都可从该色板选色。
     const img = new Image()
     img.onload = () => {
-      const adjustments = device?.layers[layerIdx]?.adjustments
-      setLayerStates(prev => ({
-        ...prev,
-        [layerIdx]: {
-          imageUrl: url,
-          naturalWidth: img.naturalWidth,
-          naturalHeight: img.naturalHeight,
-          position: { x: 0, y: 0 },
-          scale: adjustments?.scale ?? 1,
-          rotation: adjustments?.rotation ?? 0,
-        },
-      }))
+      const siblingIdxs = getSharedUploadLayerIndexes(layerIdx)
+      const replacedUrls = new Set(
+        siblingIdxs
+          .map(idx => layerStatesRef.current[idx]?.imageUrl)
+          .filter((oldUrl): oldUrl is string => Boolean(oldUrl && oldUrl !== url)),
+      )
+
+      setLayerStates(prev => {
+        const next = { ...prev }
+        for (const idx of siblingIdxs) {
+          const adj = device?.layers[idx]?.adjustments
+          next[idx] = {
+            imageUrl: url,
+            naturalWidth: img.naturalWidth,
+            naturalHeight: img.naturalHeight,
+            position: prev[idx]?.position ?? { x: 0, y: 0 },
+            scale: adj?.scale ?? 1,
+            rotation: adj?.rotation ?? 0,
+          }
+        }
+        return next
+      })
+      replacedUrls.forEach(oldUrl => URL.revokeObjectURL(oldUrl))
       const colors = extractColors(img)
       if (colors.length > 0) {
         setPickerColors(prev => ({
           ...prev,
           ...Object.fromEntries(pickerColorLayers.map(({ realIdx }) => [realIdx, colors])),
         }))
+        // 所有 picker 图层统一默认色：以第一个 picker 图层的偏好为准
+        const sortedByLuminance = [...colors].sort((a, b) => colorLuminance(a) - colorLuminance(b))
+        const firstPicker = pickerColorLayers[0]
+        const preferred = firstPicker?.layer.picker_default === 'light'
+          ? sortedByLuminance[sortedByLuminance.length - 1]
+          : sortedByLuminance[0]
         setPickedColor(prev => ({
           ...prev,
-          ...Object.fromEntries(pickerColorLayers.map(({ layer, realIdx }) => {
-            const sortedByLuminance = [...colors].sort((a, b) => colorLuminance(a) - colorLuminance(b))
-            const preferred = layer.picker_default === 'light'
-              ? sortedByLuminance[sortedByLuminance.length - 1]
-              : sortedByLuminance[0]
-            return [realIdx, preferred]
-          })),
+          ...Object.fromEntries(pickerColorLayers.map(({ realIdx }) => [realIdx, preferred])),
         }))
       }
     }
     img.src = url
     setActiveLayerIdx(layerIdx)
-  }, [pickerColorLayers, device])
+  }, [pickerColorLayers, device, getSharedUploadLayerIndexes])
 
   /* ── 拖拽/缩放/旋转 ── */
   const handleMouseDown = useCallback((layerIdx: number, e: React.MouseEvent) => {
@@ -786,7 +1046,22 @@ export function TemplateEditor() {
     setDragStart({ x: e.clientX, y: e.clientY })
     setDragStartState({ x: state.position.x, y: state.position.y, scale: state.scale, rotation: state.rotation })
     setActiveLayerIdx(layerIdx)
-  }, [])
+    // 成组联动：记录同组其他交互图层初始位置
+    groupDragRef.current = null
+    if (device) {
+      const layer = device.layers[layerIdx]
+      if (layer?.group_id) {
+        const members = device.layers
+          .map((l, i) => ({ l, i }))
+          .filter(({ l, i }) => l.group_id === layer.group_id && l.allow_user_upload && i !== layerIdx)
+          .map(({ i }) => {
+            const s = layerStatesRef.current[i]
+            return { realIdx: i, startX: s?.position.x ?? 0, startY: s?.position.y ?? 0 }
+          })
+        if (members.length > 0) groupDragRef.current = { gid: layer.group_id, members }
+      }
+    }
+  }, [device])
 
   const handleTouchStart = useCallback((layerIdx: number, e: React.TouchEvent) => {
     e.stopPropagation()
@@ -808,7 +1083,22 @@ export function TemplateEditor() {
     }
     setDragStartState({ x: state.position.x, y: state.position.y, scale: state.scale, rotation: state.rotation })
     setActiveLayerIdx(layerIdx)
-  }, [])
+    // 成组联动：记录同组其他交互图层初始位置
+    groupDragRef.current = null
+    if (device) {
+      const layer = device.layers[layerIdx]
+      if (layer?.group_id) {
+        const members = device.layers
+          .map((l, i) => ({ l, i }))
+          .filter(({ l, i }) => l.group_id === layer.group_id && l.allow_user_upload && i !== layerIdx)
+          .map(({ i }) => {
+            const s = layerStatesRef.current[i]
+            return { realIdx: i, startX: s?.position.x ?? 0, startY: s?.position.y ?? 0 }
+          })
+        if (members.length > 0) groupDragRef.current = { gid: layer.group_id, members }
+      }
+    }
+  }, [device])
 
   const handleScaleMouseDown = useCallback((layerIdx: number, mode: DragMode, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -844,13 +1134,27 @@ export function TemplateEditor() {
         const snapped = display && layer
           ? snapToEdges(raw.x + display.baseX, raw.y + display.baseY, display.dw, display.dh, dragStartState.scale, display.frameW, display.frameH)
           : raw
-        setLayerStates(prev => ({
-          ...prev,
-          [activeLayerIdx]: {
-            ...prev[activeLayerIdx],
-            position: display ? { x: snapped.x - display.baseX, y: snapped.y - display.baseY } : snapped,
-          },
-        }))
+        setLayerStates(prev => {
+          const next: Record<number, any> = {
+            ...prev,
+            [activeLayerIdx]: {
+              ...prev[activeLayerIdx],
+              position: display ? { x: snapped.x - display.baseX, y: snapped.y - display.baseY } : snapped,
+            },
+          }
+          // 成组联动：同步位置增量到同组其他图层
+          if (groupDragRef.current) {
+            for (const m of groupDragRef.current.members) {
+              if (prev[m.realIdx]) {
+                next[m.realIdx] = {
+                  ...prev[m.realIdx],
+                  position: { x: m.startX + dx / previewScale, y: m.startY + dy / previewScale },
+                }
+              }
+            }
+          }
+          return next
+        })
       } else if (dragMode.startsWith('scale-')) {
         const rect = containerRef.current!.getBoundingClientRect()
         const center = getImageTransformCenter(activeLayerIdx, { x: dragStartState.x, y: dragStartState.y })
@@ -869,7 +1173,7 @@ export function TemplateEditor() {
         setLayerStates(prev => ({ ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], rotation: newRot } }))
       }
     }
-    const onMouseUp = () => setDragMode(null)
+    const onMouseUp = () => { groupDragRef.current = null; setDragMode(null) }
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup', onMouseUp)
     return () => { window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp) }
@@ -911,13 +1215,27 @@ export function TemplateEditor() {
         const snapped = display && layer
           ? snapToEdges(raw.x + display.baseX, raw.y + display.baseY, display.dw, display.dh, dragStartState.scale, display.frameW, display.frameH)
           : raw
-        setLayerStates(prev => ({
-          ...prev,
-          [activeLayerIdx]: {
-            ...prev[activeLayerIdx],
-            position: display ? { x: snapped.x - display.baseX, y: snapped.y - display.baseY } : snapped,
-          },
-        }))
+        setLayerStates(prev => {
+          const next: Record<number, any> = {
+            ...prev,
+            [activeLayerIdx]: {
+              ...prev[activeLayerIdx],
+              position: display ? { x: snapped.x - display.baseX, y: snapped.y - display.baseY } : snapped,
+            },
+          }
+          // 成组联动：同步位置增量到同组其他图层
+          if (groupDragRef.current) {
+            for (const m of groupDragRef.current.members) {
+              if (prev[m.realIdx]) {
+                next[m.realIdx] = {
+                  ...prev[m.realIdx],
+                  position: { x: m.startX + dx / previewScale, y: m.startY + dy / previewScale },
+                }
+              }
+            }
+          }
+          return next
+        })
       } else if (dragMode.startsWith('scale-')) {
         const rect = containerRef.current!.getBoundingClientRect()
         const center = getImageTransformCenter(activeLayerIdx, { x: dragStartState.x, y: dragStartState.y })
@@ -937,6 +1255,7 @@ export function TemplateEditor() {
       }
     }
     const onTouchEnd = () => {
+      groupDragRef.current = null
       if (dragMode === 'pinch-rotate' && activeLayerIdx !== null) {
         setLayerStates(prev => {
           const s = prev[activeLayerIdx]
@@ -983,20 +1302,29 @@ export function TemplateEditor() {
   }, [device])
 
   const clearImage = useCallback((layerIdx: number) => {
-    const state = layerStates[layerIdx]
-    if (state?.imageUrl) URL.revokeObjectURL(state.imageUrl)
+    const siblingIdxs = getSharedUploadLayerIndexes(layerIdx)
+    const removedUrls = new Set(
+      siblingIdxs
+        .map(idx => layerStatesRef.current[idx]?.imageUrl)
+        .filter((url): url is string => Boolean(url)),
+    )
     setLayerStates(prev => {
       const next = { ...prev }
-      delete next[layerIdx]
+      for (const idx of siblingIdxs) delete next[idx]
       return next
     })
-    const hasOtherUploadedImage = interactiveLayers.some(({ realIdx }) => realIdx !== layerIdx && layerStates[realIdx]?.imageUrl)
+    removedUrls.forEach(url => URL.revokeObjectURL(url))
+
+    const siblingSet = new Set(siblingIdxs)
+    const hasOtherUploadedImage = interactiveLayers.some(
+      ({ realIdx }) => !siblingSet.has(realIdx) && Boolean(layerStatesRef.current[realIdx]?.imageUrl),
+    )
     if (!hasOtherUploadedImage) {
       setPickerColors({})
       setPickedColor({})
     }
-    if (activeLayerIdx === layerIdx) setActiveLayerIdx(null)
-  }, [layerStates, activeLayerIdx, interactiveLayers])
+    if (activeLayerIdx !== null && siblingSet.has(activeLayerIdx)) setActiveLayerIdx(null)
+  }, [activeLayerIdx, interactiveLayers, getSharedUploadLayerIndexes])
 
   /* ── 导出 ── */
   const handleExport = useCallback(async () => {
@@ -1028,6 +1356,8 @@ export function TemplateEditor() {
     canvas.height = exportH
     const ctx = canvas.getContext('2d')!
     const scale = exportW / device.width
+    // Android WebView 上 canvas ctx.filter 会导致渲染全黑/旋转丢失，直接跳过
+    const isAndroid = /android/i.test(navigator.userAgent)
 
     const r = Math.min(device.corner_radius * scale, exportW / 2, exportH / 2)
     ctx.beginPath()
@@ -1077,6 +1407,7 @@ export function TemplateEditor() {
 
       const borderRadiusPx = parseBorderRadius(resolveBorderRadius(css))
       const boxShadow = css['box-shadow'] || css['boxShadow']
+      const cssRotation = resolveCssRotation(css.transform) // CSS transform 中的旋转角度
 
       /* ── 绘制圆角矩形路径的 helper ── */
       const traceRoundRect = (lx: number, ly: number, rw: number, rh: number, br: number[]) => {
@@ -1165,6 +1496,16 @@ export function TemplateEditor() {
         clearBoxShadow()
       }
 
+      // ── CSS transform 旋转：与预览保持一致 ──
+      const cssRotationRad = cssRotation * Math.PI / 180
+      if (cssRotationRad !== 0) {
+        ctx.save()
+        const cx = left + w / 2, cy = top + h / 2
+        ctx.translate(cx, cy)
+        ctx.rotate(cssRotationRad)
+        ctx.translate(-cx, -cy)
+      }
+
       const uploadedState = layerStates[realIdx]
       if (uploadedState?.imageUrl) {
         try {
@@ -1196,15 +1537,19 @@ export function TemplateEditor() {
           ctx.translate(left + imageCenterX + uploadedState.position.x * scale, top + imageCenterY + uploadedState.position.y * scale)
           ctx.rotate(uploadedState.rotation * Math.PI / 180)
           ctx.scale(uploadedState.scale, uploadedState.scale)
-          ctx.filter = resolveImageFilter(layer, scale) || 'none'
-          ctx.drawImage(uploadedImage, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
-          ctx.filter = 'none'
+          const uploadedSource = isAndroid
+            ? renderSoftwareFilteredImage(uploadedImage, drawRect.width, drawRect.height, layer, scale)
+            : uploadedImage
+          if (!isAndroid) ctx.filter = resolveImageFilter(layer, scale) || 'none'
+          ctx.drawImage(uploadedSource, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
+          if (!isAndroid) ctx.filter = 'none'
           ctx.restore()
           drawInsetShadow()
         } catch (error) {
           console.error('[TemplateEditor] 用户上传图片导出失败:', uploadedState.imageUrl, error)
         }
         ctx.globalAlpha = 1
+        if (cssRotationRad !== 0) ctx.restore()
         continue
       }
 
@@ -1212,10 +1557,75 @@ export function TemplateEditor() {
       //  color / shape 类型
       // ═══════════════════════════════════════════
       if (layer.type === 'color' || layer.type === 'shape') {
-        let fillColor = css['background-color'] || css['background'] || layer.color || '#000'
-        if (layer.color_mode === 'picker' && pickedColor[realIdx]) fillColor = pickedColor[realIdx]
+        // ── 填充颜色：直接复用预览的 cssToProps，保证导出与预览完全一致 ──
+        const boxStyle = cssToProps(css) as Record<string, unknown>
+        const bgColor = (boxStyle.backgroundColor as string) || ''
+        // 原始 CSS 兜底：绕过 CSSOM 浏览器行为差异
+        const rawCssProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
+        const rawBg = rawCssProps['background'] || rawCssProps['background-image'] || ''
+        const bgImage = (boxStyle.backgroundImage as string) || (boxStyle.background as string) || rawBg || css['background-image'] || ''
+        const isGradient = bgImage !== 'none' && /gradient\(/.test(bgImage)
+        // DEBUG: 导出渐变诊断
+        if ((layer.css_code || '').includes('gradient(') || (layer.css_position_code || '').includes('gradient(')) {
+          console.log('[Export DEBUG] 渐变图层', {
+            realIdx,
+            type: layer.type,
+            color_mode: layer.color_mode,
+            css_code: layer.css_code?.substring(0, 200),
+            css_position_code: layer.css_position_code?.substring(0, 200),
+            cssKeys: Object.keys(css).filter(k => k.includes('background') || k.includes('border')),
+            cssBgImage: css['background-image'],
+            cssBackground: css['background'],
+            boxStyleBgImage: boxStyle.backgroundImage,
+            boxStyleBackground: boxStyle.background,
+            boxStyleBgColor: boxStyle.backgroundColor,
+            rawBg,
+            bgImage,
+            isGradient,
+          })
+        }
+        // DEBUG: 边框诊断
+        if ((layer.css_code || '').includes('border') || (layer.css_position_code || '').includes('border')) {
+          const rawBw = rawCssProps['border-width'] || rawCssProps['border-top-width'] || ''
+          const rawBc = rawCssProps['border-color'] || rawCssProps['border-top-color'] || ''
+          console.log('[Export DEBUG] 边框图层', {
+            realIdx,
+            type: layer.type,
+            css_code: layer.css_code?.substring(0, 200),
+            cssBorderTopWidth: css['border-top-width'],
+            cssBorderWidth: css['border-width'],
+            cssBorder: css['border'],
+            cssBorderTopColor: css['border-top-color'],
+            cssBorderColor: css['border-color'],
+            rawBw,
+            rawBc,
+          })
+        }
+
+        let fillColorRaw: string
+        if (isGradient) {
+          fillColorRaw = bgImage
+        } else if (bgColor && bgColor !== 'rgba(0, 0, 0, 0)') {
+          fillColorRaw = bgColor
+        } else if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) {
+          fillColorRaw = layer.color
+        } else {
+          fillColorRaw = ''
+        }
+
+        let fillColor = fillColorRaw
+        if (layer.color_mode === 'picker' && pickedColor[realIdx] && !fillColor.includes('gradient(')) fillColor = pickedColor[realIdx]
+        const hasFill = fillColor && fillColor !== 'transparent' && fillColor !== 'rgba(0, 0, 0, 0)'
         ctx.globalAlpha = layerAlpha
         applyBoxShadow()
+
+        const canvasGradient = hasFill
+          ? createCanvasLinearGradient(ctx, fillColor, { left, top, width: w, height: h })
+          : null
+        // Canvas 不接受 CSS gradient 字符串。解析失败时宁可不填充，也不能沿用上一个图层的 fillStyle。
+        const fillStyle: string | CanvasGradient | null = canvasGradient
+          || (!/gradient\(/i.test(fillColor) ? fillColor : null)
+        const hasRenderableFill = Boolean(fillStyle)
 
         const cpVal = getClipPath(css)
         if (cpVal) {
@@ -1223,23 +1633,40 @@ export function TemplateEditor() {
           if (clipPts) {
             ctx.save()
             ctx.translate(left, top)
-            ctx.fillStyle = fillColor
-            fillClipPath(ctx, clipPts.map(p => [p[0] * scale, p[1] * scale]))
+            if (hasRenderableFill) { ctx.fillStyle = fillStyle!; fillClipPath(ctx, clipPts.map(p => [p[0] * scale, p[1] * scale])) }
             ctx.restore()
           }
         } else if (borderRadiusPx) {
           const br = borderRadiusPx.map(v => v * scale) as [number, number, number, number]
-          ctx.fillStyle = fillColor
-          roundRect(left, top, w, h, br)
-          ctx.fill()
+          if (hasRenderableFill) { ctx.fillStyle = fillStyle!; roundRect(left, top, w, h, br); ctx.fill() }
         } else {
-          ctx.fillStyle = fillColor
-          ctx.fillRect(left, top, w, h)
+          if (hasRenderableFill) { ctx.fillStyle = fillStyle!; ctx.fillRect(left, top, w, h) }
+        }
+
+        // 绘制 border — CSSOM 和原始 CSS 双源兜底
+        const rawBorderWidth = rawCssProps['border-width'] || rawCssProps['border-top-width'] || ''
+        const rawBorderColor = rawCssProps['border-color'] || rawCssProps['border-top-color'] || ''
+        const borderWidthRaw = css.borderTopWidth || css.borderWidth || css['border-top-width'] || rawBorderWidth || ''
+        const borderColorRaw = css.borderTopColor || css.borderColor || css['border-top-color'] || rawBorderColor || ''
+        const borderWidth = parseFloat(borderWidthRaw) || 0
+        if (borderWidth > 0) {
+          const borderColor = borderColorRaw || '#000'
+          ctx.strokeStyle = borderColor
+          ctx.lineWidth = borderWidth * scale
+          if (borderRadiusPx) {
+            const br = borderRadiusPx.map(v => v * scale) as [number, number, number, number]
+            roundRect(left, top, w, h, br)
+          } else {
+            ctx.beginPath()
+            ctx.rect(left, top, w, h)
+          }
+          ctx.stroke()
         }
 
         clearBoxShadow()
         drawInsetShadow()
         ctx.globalAlpha = 1
+        if (cssRotationRad !== 0) ctx.restore()
         continue
       }
 
@@ -1248,7 +1675,7 @@ export function TemplateEditor() {
       // ═══════════════════════════════════════════
       if (layer.type === 'text') {
         const text = (editedTexts[realIdx] ?? layer.text_content) || ''
-        if (!text) continue
+        if (!text) { if (cssRotationRad !== 0) ctx.restore(); continue }
         const textStyle = resolveTextStyle(layer, device.width, device.height)
         const fs = textStyle.fontSize * scale
         const lineHeight = textStyle.lineHeightPx * scale
@@ -1283,6 +1710,7 @@ export function TemplateEditor() {
         clearBoxShadow()
         drawInsetShadow()
         ctx.globalAlpha = 1
+        if (cssRotationRad !== 0) ctx.restore()
         continue
       }
 
@@ -1291,7 +1719,7 @@ export function TemplateEditor() {
       // ═══════════════════════════════════════════
       if (layer.type === 'svg') {
         const svgCode = layer.css_code || ''
-        if (!svgCode) continue
+        if (!svgCode) { if (cssRotationRad !== 0) ctx.restore(); continue }
         try {
           // 保留 SVG 内部每个路径、渐变、遮罩和嵌套 SVG；固定颜色只作用于 currentColor。
           let finalSvg = svgCode
@@ -1345,6 +1773,7 @@ export function TemplateEditor() {
           drawInsetShadow()
           ctx.globalAlpha = 1
         } catch (e) { console.error('[TemplateEditor] SVG 导出失败:', e) }
+        if (cssRotationRad !== 0) ctx.restore()
         continue
       }
 
@@ -1353,7 +1782,7 @@ export function TemplateEditor() {
       // ═══════════════════════════════════════════
       if (layer.type === 'image') {
         const imgUrl = layer.image_url
-        if (!imgUrl) continue
+        if (!imgUrl) { if (cssRotationRad !== 0) ctx.restore(); continue }
         console.log(`[export] image "${layer.name}":`, { borderRadiusPx, clipPath: getClipPath(css), shorthand: css['border-radius'], tl: css['border-top-left-radius'], tr: css['border-top-right-radius'], br: css['border-bottom-right-radius'], bl: css['border-bottom-left-radius'] })
 
         try {
@@ -1375,14 +1804,18 @@ export function TemplateEditor() {
           ctx.translate(imageCenterX, imageCenterY)
           ctx.rotate((layer.adjustments?.rotation ?? 0) * Math.PI / 180)
           ctx.scale(layer.adjustments?.scale ?? 1, layer.adjustments?.scale ?? 1)
-          ctx.filter = resolveImageFilter(layer, scale) || 'none'
-          ctx.drawImage(img, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
-          ctx.filter = 'none'
+          const imageSource = isAndroid
+            ? renderSoftwareFilteredImage(img, drawRect.width, drawRect.height, layer, scale)
+            : img
+          if (!isAndroid) ctx.filter = resolveImageFilter(layer, scale) || 'none'
+          ctx.drawImage(imageSource, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
+          if (!isAndroid) ctx.filter = 'none'
           ctx.restore()
           clearBoxShadow()
           drawInsetShadow()
         } catch (e) { console.error('[TemplateEditor] 静态图片导出失败:', imgUrl, e) }
         ctx.globalAlpha = 1
+        if (cssRotationRad !== 0) ctx.restore()
       }
     }
 
@@ -1443,12 +1876,12 @@ export function TemplateEditor() {
     <div className={`h-dvh flex flex-col overflow-hidden${IS_OFFLINE ? ' safe-area-pad' : ''}`} style={{ background: 'var(--bg-primary)' }}>
       {!IS_OFFLINE && <Navbar />}
 
-      <main className="flex-1 relative z-10 overflow-auto lg:overflow-hidden">
+      <main className="flex-1 relative z-10 overflow-auto">
         <div className="min-h-full lg:h-full px-4 lg:px-6 py-4 lg:py-5">
           <div className="flex flex-col lg:grid lg:grid-cols-3 gap-4 lg:gap-5 lg:h-full">
 
             {/* 左侧 - 预览编辑区 */}
-            <div className="lg:col-span-2 flex flex-col rounded-lg lg:h-full lg:max-h-none lg:min-h-0 lg:overflow-hidden" style={{ background: 'var(--bg-secondary)', boxShadow: 'var(--shadow-card)', border: '1px solid var(--border-color)' }}>
+            <div className="lg:col-span-2 flex flex-col rounded-lg lg:h-full lg:max-h-none lg:min-h-0" style={{ background: 'var(--bg-secondary)', boxShadow: 'var(--shadow-card)', border: '1px solid var(--border-color)' }}>
               {device ? (
                 <>
                   <div className="flex items-center gap-3 px-4 lg:px-5 pt-4 lg:pt-5 pb-2 flex-shrink-0">
@@ -1521,9 +1954,18 @@ export function TemplateEditor() {
                         ))}
                         {interactiveLayers.some(({ realIdx }) => layerStates[realIdx]?.imageUrl) ? (
                           <>
-                            <div className="absolute" style={{ left: vpLeft, top: vpTop, width: previewWidth, height: previewHeight, borderRadius: cornerRadius }}>
-                              <div className="absolute inset-0" style={{ background: device.background || '#FFFFFF', borderRadius: cornerRadius, overflow: 'hidden' }} />
-                              <div style={{ width: device.width, height: device.height, transform: `scale(${previewScale})`, transformOrigin: 'top left', position: 'relative', overflow: 'hidden', borderRadius: cornerRadius / previewScale }}>
+                            <div className="absolute" style={{
+                              left: vpLeft,
+                              top: vpTop,
+                              width: previewWidth,
+                              height: previewHeight,
+                              borderRadius: cornerRadius,
+                              overflow: 'hidden',
+                              clipPath: `inset(0 round ${cornerRadius}px)`,
+                              WebkitClipPath: `inset(0 round ${cornerRadius}px)`,
+                            }}>
+                              <div className="absolute inset-0" style={{ background: device.background || '#FFFFFF' }} />
+                              <div style={{ width: device.width, height: device.height, transform: `scale(${previewScale})`, transformOrigin: 'top left', position: 'relative', willChange: 'transform' }}>
                                 {sortedLayers.map(({ layer, realIdx }, sortIdx) => {
                                   const isInteractive = (layer.type === 'image' || layer.type === 'svg' || layer.type === 'shape')
                                     && layer.allow_user_upload
@@ -1533,6 +1975,11 @@ export function TemplateEditor() {
                                   const fx = layer.effects
                                   const backdropBlur = fx && fx.blur_type === 'backdrop' && fx.blur_value > 0 ? fx.blur_value : 0
                                   const fxOpacity = fx && fx.opacity < 100 ? fx.opacity / 100 : undefined
+                                  // Android/HyperOS 必须完全省略 backdrop-filter；仅改变背景色仍会触发黑色 GPU 纹理。
+                                  const backdropFilterStyle: React.CSSProperties = backdropFilterOk
+                                    ? { backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)` }
+                                    : {}
+                                  const backdropFallbackBg = backdropFilterOk ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.22)'
                                   if (!isInteractive) {
                                     // ── 非交互图层：SVG / Shape / Color / Static Image ──
                                     if (layer.type === 'svg') {
@@ -1543,9 +1990,9 @@ export function TemplateEditor() {
                                         layer.color_mode === 'picker' ? applySvgColor(layer.css_code || '', svgColor) : layer.css_code || '',
                                       )
                                       return (
-                                        <div key={sortIdx} style={{ ...style, overflow: 'hidden', color: svgColor, opacity: fxOpacity, boxShadow: svgBoxShadow, pointerEvents: 'none' }}>
+                                        <div key={sortIdx} style={{ ...style, overflow: 'hidden', color: svgColor, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), boxShadow: svgBoxShadow, pointerEvents: 'none' }}>
                                           {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
+                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
                                           )}
                                           <div style={{ position: 'relative', zIndex: 1, width: '100%', height: '100%' }} dangerouslySetInnerHTML={{ __html: renderedSvg }} />
                                         </div>
@@ -1553,12 +2000,39 @@ export function TemplateEditor() {
                                     }
                                     if (layer.type === 'shape') {
                                       const style = getLayerBoxStyle(layer, css, device.width, device.height)
-                                      if (layer.color) style.backgroundColor = layer.color
-                                      if (layer.color_mode === 'picker' && pickedColor[realIdx]) style.backgroundColor = pickedColor[realIdx]
+                                      // 原始 CSS 兜底：绕过 CSSOM 浏览器差异，确保渐变和边框一定出现
+                                      const rawShapeProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
+                                      const rawGradient = rawShapeProps['background'] || rawShapeProps['background-image'] || ''
+                                      if (rawGradient && rawGradient !== 'none' && /gradient\(/.test(rawGradient) && !(style as any).backgroundImage && !(style as any).background) {
+                                        (style as any).backgroundImage = rawGradient
+                                      }
+                                      const rawBorderVal = rawShapeProps['border'] || ''
+                                      if (rawBorderVal && rawBorderVal !== 'none' && !style.border && !style.borderTopWidth) {
+                                        style.border = rawBorderVal
+                                      }
+                                      // DEBUG: shape 预览诊断
+                                      if (rawGradient || rawBorderVal) {
+                                        console.log('[Preview DEBUG] shape层', {
+                                          realIdx,
+                                          type: layer.type,
+                                          cssBgKeys: Object.keys(css).filter(k => k.includes('background') || k.includes('border')),
+                                          styleBgImage: (style as any).backgroundImage,
+                                          styleBackground: (style as any).background,
+                                          styleBorder: (style as any).border,
+                                          styleBorderTopWidth: (style as any).borderTopWidth,
+                                          rawGradient,
+                                          rawBorderVal,
+                                        })
+                                      }
+                                      if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) style.backgroundColor = layer.color
+                                      if (layer.color_mode === 'picker' && pickedColor[realIdx]) {
+                                        const bgGradient = (css['background'] || css['background-color'] || css['background-image'] || css.backgroundColor || '').includes('gradient(')
+                                        if (!bgGradient) style.backgroundColor = pickedColor[realIdx]
+                                      }
                                       return (
-                                        <div key={sortIdx} style={{ ...style, opacity: fxOpacity, pointerEvents: 'none' }}>
+                                        <div key={sortIdx} style={{ ...style, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), pointerEvents: 'none' }}>
                                           {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
+                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
                                           )}
                                         </div>
                                       )
@@ -1587,7 +2061,7 @@ export function TemplateEditor() {
                                         textAlign: textStyle.textAlign,
                                         whiteSpace: 'pre-wrap',
                                         wordBreak: 'break-word',
-                                        opacity: fxOpacity,
+                                        ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}),
                                         cursor: 'text',
                                         zIndex: 50,
                                       }
@@ -1595,7 +2069,7 @@ export function TemplateEditor() {
                                         <div key={sortIdx} style={textBoxStyle}
                                           onClick={(e) => { e.stopPropagation(); setEditingTextIdx(realIdx); setEditedTexts(prev => ({ ...prev, [realIdx]: prev[realIdx] ?? layer.text_content ?? '' })) }}>
                                           {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: '-4px', backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 0 }} />
+                                            <div style={{ position: 'absolute', inset: '-4px', ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0 }} />
                                           )}
                                           <span style={{ position: 'relative', zIndex: 1, width: '100%', pointerEvents: 'none', outline: editingTextIdx === realIdx ? '1px solid var(--accent)' : undefined, outlineOffset: 2 }}>
                                             {displayText || <span style={{ opacity: 0.4 }}>点击后在设备下方编辑文字</span>}
@@ -1609,18 +2083,77 @@ export function TemplateEditor() {
                                         const rect = resolveLayerRect(layer, css, device.width, device.height)
                                         const clipPts = parseClipPathToPoints(cpVal, rect.w, rect.h)
                                         if (clipPts) {
-                                          let fillColor = css['background-color'] || css['background'] || layer.color || '#000'
-                                          if (layer.color_mode === 'picker' && pickedColor[realIdx]) fillColor = pickedColor[realIdx]
-                                          return <svg key={sortIdx} style={{ position: 'absolute', left: rect.left, top: rect.top, width: rect.w, height: rect.h, overflow: 'visible', opacity: fxOpacity, pointerEvents: 'none' }}><polygon points={pointsToSvgAttr(clipPts)} fill={fillColor} /></svg>
+                                          const boxStyle2 = cssToProps(css) as Record<string, unknown>
+                                          const bgColor2 = (boxStyle2.backgroundColor as string) || ''
+                                          const rawProps2 = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
+                                          const rawBg2 = rawProps2['background'] || rawProps2['background-image'] || ''
+                                          const bgImage2 = (boxStyle2.backgroundImage as string) || (boxStyle2.background as string) || rawBg2 || css['background-image'] || ''
+                                          const isGradient2 = bgImage2 !== 'none' && /gradient\(/.test(bgImage2)
+
+                                          // DEBUG: clip-path color 预览诊断
+                                          if (rawBg2 || (layer.css_code || '').includes('gradient(') || (layer.css_position_code || '').includes('gradient(')) {
+                                            console.log('[Preview DEBUG] clip-path color层', {
+                                              realIdx,
+                                              cssBgImage: css['background-image'],
+                                              cssBackground: css['background'],
+                                              boxStyleBgImage: boxStyle2.backgroundImage,
+                                              boxStyleBackground: boxStyle2.background,
+                                              boxStyleBgColor: boxStyle2.backgroundColor,
+                                              rawBg2,
+                                              bgImage2,
+                                              isGradient2,
+                                            })
+                                          }
+
+                                          let fillColor: string
+                                          if (isGradient2) {
+                                            fillColor = bgImage2
+                                          } else if (bgColor2 && bgColor2 !== 'rgba(0, 0, 0, 0)') {
+                                            fillColor = bgColor2
+                                          } else if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) {
+                                            fillColor = layer.color
+                                          } else {
+                                            fillColor = '#000'
+                                          }
+
+                                          if (layer.color_mode === 'picker' && pickedColor[realIdx] && !fillColor.includes('gradient(')) fillColor = pickedColor[realIdx]
+                                          return <svg key={sortIdx} style={{ position: 'absolute', left: rect.left, top: rect.top, width: rect.w, height: rect.h, overflow: 'visible', ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), pointerEvents: 'none' }}><polygon points={pointsToSvgAttr(clipPts)} fill={fillColor} /></svg>
                                         }
                                       }
                                       const style = getLayerBoxStyle(layer, css, device.width, device.height)
-                                      if (layer.color_mode === 'picker' && pickedColor[realIdx]) style.backgroundColor = pickedColor[realIdx]
-                                      else if (layer.color && !css['background'] && !css['background-color']) style.backgroundColor = layer.color
+                                      // 原始 CSS 兜底渐变和边框
+                                      const rawColorProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
+                                      const rawGrad = rawColorProps['background'] || rawColorProps['background-image'] || ''
+                                      if (rawGrad && rawGrad !== 'none' && /gradient\(/.test(rawGrad) && !(style as any).backgroundImage && !(style as any).background) {
+                                        (style as any).backgroundImage = rawGrad
+                                      }
+                                      const rawBdr = rawColorProps['border'] || ''
+                                      if (rawBdr && rawBdr !== 'none' && !style.border && !style.borderTopWidth) {
+                                        style.border = rawBdr
+                                      }
+                                      // DEBUG: color 预览诊断
+                                      if (rawGrad || rawBdr) {
+                                        console.log('[Preview DEBUG] color层', {
+                                          realIdx,
+                                          type: layer.type,
+                                          cssBgKeys: Object.keys(css).filter(k => k.includes('background') || k.includes('border')),
+                                          styleBgImage: (style as any).backgroundImage,
+                                          styleBackground: (style as any).background,
+                                          styleBorder: (style as any).border,
+                                          styleBorderTopWidth: (style as any).borderTopWidth,
+                                          rawGrad,
+                                          rawBdr,
+                                        })
+                                      }
+                                      if (layer.color_mode === 'picker' && pickedColor[realIdx]) {
+                                        const bgGradient = (css['background'] || css['background-color'] || css['background-image'] || css.backgroundColor || '').includes('gradient(')
+                                        if (!bgGradient) style.backgroundColor = pickedColor[realIdx]
+                                      }
+                                      else if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) style.backgroundColor = layer.color
                                       return (
-                                        <div key={sortIdx} style={{ ...style, opacity: fxOpacity, pointerEvents: 'none' }}>
+                                        <div key={sortIdx} style={{ ...style, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), pointerEvents: 'none' }}>
                                           {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
+                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
                                           )}
                                         </div>
                                       )
@@ -1631,9 +2164,9 @@ export function TemplateEditor() {
                                       const imageFit = typeof style.objectFit === 'string' ? style.objectFit : 'fill'
                                       const imagePosition = typeof style.objectPosition === 'string' ? style.objectPosition : '50% 50%'
                                       return (
-                                        <div key={sortIdx} style={{ ...style, opacity: fxOpacity, overflow: 'hidden', pointerEvents: 'none' }}>
+                                        <div key={sortIdx} style={{ ...style, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), overflow: 'hidden', pointerEvents: 'none' }}>
                                           {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 1, borderRadius: 'inherit' }} />
+                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 1, borderRadius: 'inherit' }} />
                                           )}
                                           <img src={layer.image_url} alt="" draggable={false} style={{
                                             width: '100%',
@@ -1647,6 +2180,9 @@ export function TemplateEditor() {
                                             zIndex: 2,
                                             transform: `rotate(${layer.adjustments?.rotation ?? 0}deg) scale(${layer.adjustments?.scale ?? 1})`,
                                             filter: resolveImageFilter(layer),
+                                            WebkitFilter: resolveImageFilter(layer),
+                                            willChange: 'transform, filter',
+                                            backfaceVisibility: 'hidden',
                                           }} />
                                         </div>
                                       )
@@ -1663,6 +2199,31 @@ export function TemplateEditor() {
                                   const cssBoxShadow = css['box-shadow'] || css['boxShadow']
                                   const isInsetBoxShadow = /\binset\b/i.test(cssBoxShadow || '')
                                   const layerOpacity = parseFloat(css['opacity'] || '1')
+                                  const interactiveStyle = getLayerBoxStyle(layer, css, device.width, device.height)
+                                  if (layer.type === 'shape') {
+                                    const rawShapeProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
+                                    const rawGradient = rawShapeProps['background'] || rawShapeProps['background-image'] || ''
+                                    if (rawGradient && rawGradient !== 'none' && /gradient\(/.test(rawGradient) && !interactiveStyle.backgroundImage && !interactiveStyle.background) {
+                                      interactiveStyle.backgroundImage = rawGradient
+                                    }
+                                    const rawBorder = rawShapeProps.border || ''
+                                    if (rawBorder && rawBorder !== 'none' && !interactiveStyle.border && !interactiveStyle.borderTopWidth) {
+                                      interactiveStyle.border = rawBorder
+                                    }
+                                    const hasGradient = String(
+                                      interactiveStyle.backgroundImage || interactiveStyle.background || rawGradient || css['background-image'] || css.background || '',
+                                    ).includes('gradient(')
+                                    if (layer.color_mode === 'picker' && pickedColor[realIdx] && !hasGradient) {
+                                      interactiveStyle.backgroundColor = pickedColor[realIdx]
+                                    } else if (layer.color && !css.background && !css['background-color'] && !css.backgroundColor) {
+                                      interactiveStyle.backgroundColor = layer.color
+                                    }
+                                  }
+                                  const hasVisualContent = Boolean(
+                                    state?.imageUrl
+                                    || (layer.show_on_client !== false && layer.image_url)
+                                    || layer.type === 'shape',
+                                  )
 
                                   const displayRect = state?.naturalWidth && state.naturalHeight
                                     ? resolveImageDrawRect(
@@ -1676,14 +2237,14 @@ export function TemplateEditor() {
 
                                   return (
                                     <div key={sortIdx} data-interactive="true"
-                                      style={{ position: 'absolute', left: cssLeft, top: cssTop, width: cssW, height: cssH, transform: stripTranslateTransform(css.transform), opacity: (state?.imageUrl || (layer.show_on_client !== false && layer.image_url)) ? layerOpacity : 0, cursor: state?.imageUrl ? (dragMode === 'move' ? 'grabbing' : 'grab') : 'pointer', pointerEvents: 'auto', borderRadius: cssBorderRadius, clipPath: getRoundedClipPath(cssBorderRadius), WebkitClipPath: getRoundedClipPath(cssBorderRadius), boxShadow: isInsetBoxShadow ? undefined : cssBoxShadow, touchAction: 'none', overflow: 'hidden' }}
+                                      style={{ ...interactiveStyle, zIndex: layer.z_index ?? 0, opacity: hasVisualContent ? layerOpacity : 0, cursor: state?.imageUrl ? (dragMode === 'move' ? 'grabbing' : 'grab') : 'pointer', pointerEvents: hasVisualContent ? 'auto' : 'none', borderRadius: cssBorderRadius, clipPath: getRoundedClipPath(cssBorderRadius), WebkitClipPath: getRoundedClipPath(cssBorderRadius), boxShadow: isInsetBoxShadow ? undefined : cssBoxShadow, touchAction: 'none', overflow: 'hidden', willChange: 'transform' }}
                                       onMouseDown={(e) => { if (state?.imageUrl) { setActiveLayerIdx(realIdx); handleMouseDown(realIdx, e) } }}
                                       onTouchStart={(e) => { if (state?.imageUrl) { setActiveLayerIdx(realIdx); handleTouchStart(realIdx, e) } }}
                                       onClick={(e) => { e.stopPropagation(); if (!state?.imageUrl) fileInputRefs.current[realIdx]?.click() }}>
                                       <div style={{ width: '100%', height: '100%', overflow: 'hidden', borderRadius: 'inherit', position: 'relative' }}>
                                       {/* 背景模糊 overlay */}
                                       {backdropBlur > 0 && (
-                                        <div style={{ position: 'absolute', inset: 0, backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
+                                        <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
                                       )}
                                       {state?.imageUrl ? (
                                         <div style={{
@@ -1696,6 +2257,10 @@ export function TemplateEditor() {
                                           transform: `translate(${state.position.x}px, ${state.position.y}px) rotate(${state.rotation}deg) scale(${state.scale})`,
                                           transformOrigin: 'center center',
                                           zIndex: 1,
+                                          filter: resolveImageFilter(layer),
+                                          WebkitFilter: resolveImageFilter(layer),
+                                          willChange: 'transform, filter',
+                                          backfaceVisibility: 'hidden',
                                         }}>
                                           <img src={state.imageUrl} alt="" draggable={false} style={{
                                             width: '100%',
@@ -1703,7 +2268,6 @@ export function TemplateEditor() {
                                             maxWidth: 'none',
                                             display: 'block',
                                             pointerEvents: 'none',
-                                            filter: resolveImageFilter(layer),
                                           }} />
                                         </div>
                                       ) : layer.show_on_client !== false && layer.image_url ? (
@@ -1718,6 +2282,9 @@ export function TemplateEditor() {
                                           zIndex: 1,
                                           transform: `rotate(${layer.adjustments?.rotation ?? 0}deg) scale(${layer.adjustments?.scale ?? 1})`,
                                           filter: resolveImageFilter(layer),
+                                          WebkitFilter: resolveImageFilter(layer),
+                                          willChange: 'transform, filter',
+                                          backfaceVisibility: 'hidden',
                                         }} />
                                       ) : null}
                                       {isInsetBoxShadow && (
@@ -1887,30 +2454,41 @@ export function TemplateEditor() {
 
                 {device && pickerColorLayers.some(({ realIdx }) => pickerColors[realIdx]?.length > 0) && (
                   <div className="rounded-xl p-4 lg:p-5" style={{ background: 'var(--bg-secondary)', boxShadow: 'var(--shadow-card)', border: '1px solid var(--border-color)' }}>
-                    <h3 className="text-sm lg:text-base font-semibold mb-3" style={{ color: 'var(--text-primary)' }}>主题颜色</h3>
-                    {pickerColorLayers.filter(({ realIdx }) => pickerColors[realIdx]?.length > 0).map(({ realIdx }) => (
-                      <div key={realIdx} className="mb-2 last:mb-0">
-                        <div className="text-[10px] mb-1.5" style={{ color: 'var(--text-muted)' }}>图层 {realIdx + 1}</div>
+                    <h3 className="text-sm lg:text-base font-semibold mb-3" style={{ color: 'var(--text-primary)' }}>主题颜色（所有图层统一）</h3>
+                    {/* 取第一个有颜色数据的 picker 图层作为色板来源 */}
+                    {(() => {
+                      const firstPicker = pickerColorLayers.find(({ realIdx }) => pickerColors[realIdx]?.length > 0)
+                      if (!firstPicker) return null
+                      const { realIdx: firstIdx } = firstPicker
+                      const currentColor = pickedColor[firstIdx]
+                      const setAllPickerColor = (color: string) => {
+                        setPickedColor(prev => {
+                          const next = { ...prev }
+                          for (const { realIdx } of pickerColorLayers) next[realIdx] = color
+                          return next
+                        })
+                      }
+                      return (
                         <div className="flex items-center gap-2 flex-wrap">
-                          {(pickerColors[realIdx] || []).map(color => (
-                            <button key={color} onClick={() => setPickedColor(prev => ({ ...prev, [realIdx]: color }))}
+                          {(pickerColors[firstIdx] || []).map(color => (
+                            <button key={color} onClick={() => setAllPickerColor(color)}
                               className="w-7 h-7 rounded-full transition-all duration-200 flex-shrink-0"
                               style={{
                                 background: color,
-                                border: `2.5px solid ${pickedColor[realIdx] === color ? 'var(--accent)' : 'var(--border-color)'}`,
-                                transform: pickedColor[realIdx] === color ? 'scale(1.15)' : 'scale(1)',
+                                border: `2.5px solid ${currentColor === color ? 'var(--accent)' : 'var(--border-color)'}`,
+                                transform: currentColor === color ? 'scale(1.15)' : 'scale(1)',
                               }} title={color} />
                           ))}
                           <label className="w-7 h-7 rounded-full cursor-pointer flex-shrink-0 flex items-center justify-center"
-                            style={{ background: pickedColor[realIdx] || '#fff', border: '2.5px solid var(--border-color)' }}>
-                            <input type="color" value={pickedColor[realIdx] || '#ffffff'}
-                              onChange={(e) => setPickedColor(prev => ({ ...prev, [realIdx]: e.target.value }))}
+                            style={{ background: currentColor || '#fff', border: '2.5px solid var(--border-color)' }}>
+                            <input type="color" value={currentColor || '#ffffff'}
+                              onChange={(e) => setAllPickerColor(e.target.value)}
                               className="sr-only" />
                             <Palette className="w-3 h-3" style={{ color: '#fff', filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.3))' }} />
                           </label>
                         </div>
-                      </div>
-                    ))}
+                      )
+                    })()}
                   </div>
                 )}
 

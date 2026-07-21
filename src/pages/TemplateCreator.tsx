@@ -2,7 +2,7 @@ import { useState, useMemo, useRef, useCallback, useEffect } from 'react'
 import { apiFetch, apiUploadTo, API_BASE } from '@/lib/api'
 import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssTranslation, resolveTextStyle, stripTranslateTransform } from '@/lib/templateTextStyle'
 import {
-  Trash2, GripVertical, Save, Image, Shapes,
+  Trash2, GripVertical, Save, Image, Shapes, Group,
   ChevronDown, ChevronRight, Monitor, X, Type, Upload,
 } from 'lucide-react'
 
@@ -778,6 +778,21 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
         setSelectedIds(new Set())
         if (expandedId && selectedIds.has(expandedId)) setExpandedId(null)
       }
+
+      // 方向键微调选中图层位置（1px，Shift+方向键 10px）
+      const arrowKeys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'] as const
+      if (arrowKeys.includes(e.key as typeof arrowKeys[number]) && selectedIds.size > 0 && !isInput && !isMod) {
+        e.preventDefault()
+        const step = e.shiftKey ? 10 : 1
+        const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0
+        const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0
+        setDeviceLayers(prev => prev.map(l => {
+          if (!selectedIds.has(l.id)) return l
+          const nx = l.x + dx
+          const ny = l.y + dy
+          return { ...l, ...writeDraggedPosition(l, nx, ny) }
+        }))
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -789,7 +804,8 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     e.preventDefault(); if (dragIdx === null || dragIdx === idx) return
     setDeviceLayers(prev => {
       const r = [...prev]; const [m] = r.splice(dragIdx, 1); r.splice(idx, 0, m)
-      return r.map((l, i) => ({ ...l, z_index: i }))
+      // index 0 = 列表最上面 = 最高层（z_index 最大）
+      return r.map((l, i) => ({ ...l, z_index: r.length - 1 - i }))
     }); setDragIdx(idx)
   }
   const handleDragEnd = () => setDragIdx(null)
@@ -1276,6 +1292,26 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
                     style={{ color: selectedIds.size < 1 ? 'var(--text-muted)' : 'var(--accent)', background: 'transparent', opacity: selectedIds.size < 1 ? 0.35 : 1, cursor: selectedIds.size < 1 ? 'default' : 'pointer' }}>
                     {ALIGN_ICONS['center']}
                   </button>
+                  <span className="w-px h-5 mx-1" style={{ background: 'var(--border-color)' }} />
+                  <button onClick={() => {
+                    const gid = `g_${Date.now()}`
+                    setDeviceLayers(prev => prev.map(l => selectedIds.has(l.id) ? { ...l, group_id: gid } : l))
+                  }} disabled={selectedIds.size < 2}
+                    className="p-1.5 rounded-md transition-all"
+                    title="成组 (Ctrl+G)"
+                    style={{ color: selectedIds.size < 2 ? 'var(--text-muted)' : 'var(--accent)', background: 'transparent', opacity: selectedIds.size < 2 ? 0.35 : 1, cursor: selectedIds.size < 2 ? 'default' : 'pointer' }}>
+                    <Group className="w-3.5 h-3.5" />
+                  </button>
+                  {layers.some(l => selectedIds.has(l.id) && l.group_id) && (
+                    <button onClick={() => {
+                      setDeviceLayers(prev => prev.map(l => selectedIds.has(l.id) ? { ...l, group_id: undefined } : l))
+                    }}
+                      className="p-1.5 rounded-md transition-all"
+                      title="解组 (Ctrl+Shift+G)"
+                      style={{ color: 'var(--danger)', background: 'transparent' }}>
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                   {selectedIds.size > 0 && (
                     <button onClick={() => setSelectedIds(new Set())}
                       className="p-1.5 rounded-md transition-all ml-1" title="取消选择"
@@ -1448,7 +1484,7 @@ function LayerCard({
 
       {/* 配置面板 - 带折叠动画 */}
       <div style={{
-        maxHeight: expanded ? '800px' : '0px',
+        maxHeight: expanded ? '5000px' : '0px',
         overflow: 'hidden',
         transition: 'max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease',
         opacity: expanded ? 1 : 0,
@@ -1504,6 +1540,14 @@ function ImageLayerConfig({ layer, onUpdate, deviceW, deviceH }: { layer: Templa
       css_position_code: serializeCssDeclarations(positionCss),
     })
   }
+  const setPosition = (property: 'x' | 'y', value: number) => {
+    const positionCss = parseCssDeclarations(layer.css_position_code || '')
+    positionCss[property === 'x' ? 'left' : 'top'] = `${Math.round(value)}px`
+    onUpdate({
+      [property]: value,
+      css_position_code: serializeCssDeclarations(positionCss),
+    })
+  }
   const selectImage = () => {
     const input = document.createElement('input')
     input.type = 'file'
@@ -1520,8 +1564,8 @@ function ImageLayerConfig({ layer, onUpdate, deviceW, deviceH }: { layer: Templa
       setUploading(true)
       try {
         const result = await apiUploadTo('/api/templates/upload-image', file)
-        const imageUrl = /^https?:\/\//i.test(result.path) ? result.path : `${API_BASE}${result.path}`
-        onUpdate({ image_url: imageUrl, admin_preview_url: '' })
+        // 仅存相对路径，避免 dev 环境的 localhost 绝对地址写入模板数据
+        onUpdate({ image_url: result.path, admin_preview_url: '' })
       } catch (error) {
         window.alert(error instanceof Error ? error.message : '图片上传失败')
       } finally {
@@ -1547,12 +1591,12 @@ function ImageLayerConfig({ layer, onUpdate, deviceW, deviceH }: { layer: Templa
         <div>
           <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>X 坐标</label>
           <ScrubInput value={layer.x} min={-9999} max={9999} step={1} unit="px"
-            onChange={v => onUpdate({ x: v })} />
+            onChange={v => setPosition('x', v)} />
         </div>
         <div>
           <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Y 坐标</label>
           <ScrubInput value={layer.y} min={-9999} max={9999} step={1} unit="px"
-            onChange={v => onUpdate({ y: v })} />
+            onChange={v => setPosition('y', v)} />
         </div>
         <div>
           <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>图片宽度</label>

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node -e \"const{readdirSync,unlinkSync,rmdirSync,existsSync,statSync}=require('fs');const{join}=require('path');function rmrf(d){if(!existsSync(d))return;readdirSync(d).forEach(f=>{const p=join(d,f);try{(statSync(p).isDirectory()?rmrf:unlinkSync)(p)}catch(e){console.error('prebuild: cannot delete',p,e.message)}});rmdirSync(d)}rmrf('dist')\"",
     "build": "tsc -b && vite build && node scripts/copy-api.mjs && node scripts/backup.mjs",
     "build:offline": "vite build --mode offline",
     "lint": "eslint .",

@@ -902,7 +902,7 @@ export function ComponentAdmin() {
                               const file = e.target.files?.[0]; if (!file) return
                               try {
                                 const r = await apiUploadTo('/api/gallery/upload', file)
-                                updateLayer(realIdx, { image_url: `${API_BASE}${r.path}` })
+                                updateLayer(realIdx, { image_url: r.path })
                               } catch (err: any) { setMsg(err.message) }
                               e.target.value = ''
                             }} />

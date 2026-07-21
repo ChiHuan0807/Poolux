@@ -134,4 +134,11 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
 app.listen(PORT, () => {
   console.log(`[poolux-api] 运行在 http://localhost:${PORT}`)
+  const ghToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+  const ghRepo = process.env.GITHUB_REPO
+  if (!ghToken || !ghRepo) {
+    console.warn(
+      '[poolux-api] APK 打包未就绪：请在 poolux-api/.env 配置 GITHUB_TOKEN 与 GITHUB_REPO（参考 .env.example），然后重启本服务',
+    )
+  }
 })

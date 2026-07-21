@@ -183,6 +183,19 @@ export function stripTranslateTransform(transform: string | undefined): string {
   return stripped || 'none'
 }
 
+/** 从 CSS transform 字符串中提取累计旋转角度（deg）。 */
+export function resolveCssRotation(transform: string | undefined): number {
+  if (!transform || transform === 'none') return 0
+  let deg = 0
+  for (const m of transform.matchAll(/rotate\(\s*([-\d.]+)\s*deg\s*\)/gi)) {
+    deg += Number.parseFloat(m[1]) || 0
+  }
+  for (const m of transform.matchAll(/rotate\(\s*([-\d.]+)\s*rad\s*\)/gi)) {
+    deg += (Number.parseFloat(m[1]) || 0) * (180 / Math.PI)
+  }
+  return deg
+}
+
 export function resolveTextStyle(layer: TextStyleLayer, deviceWidth: number, deviceHeight: number): ResolvedTextStyle {
   const css = {
     ...parseCssDeclarations(layer.css_code || ''),
