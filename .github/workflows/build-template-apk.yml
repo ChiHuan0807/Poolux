@@ -56,7 +56,7 @@ jobs:
           java-version: 21
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install ImageMagick
         run: sudo apt-get update && sudo apt-get install -y imagemagick
@@ -116,9 +116,10 @@ jobs:
         if: failure()
         run: |
           if [ -n "${FAIL_URL:-}" ] && [ -n "${CALLBACK_TOKEN:-}" ]; then
+            RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             curl -sS -X POST \
               -H "X-Callback-Token: ${CALLBACK_TOKEN}" \
               -H "Content-Type: application/json" \
-              -d "{\"error\":\"GitHub Actions 编译失败 (job=${JOB_ID:-unknown})\"}" \
+              -d "{\"error\":\"GitHub Actions 编译失败，出错步骤与日志见 ${RUN_URL}\"}" \
               "$FAIL_URL" || true
           fi
