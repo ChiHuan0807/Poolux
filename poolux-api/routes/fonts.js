@@ -1,16 +1,10 @@
 import { Router } from 'express'
 import multer from 'multer'
-import { join, dirname, extname } from 'path'
-import { fileURLToPath } from 'url'
-import { mkdirSync, existsSync, unlinkSync } from 'fs'
+import { join, extname } from 'path'
+import { existsSync, unlinkSync } from 'fs'
 import { authMiddleware } from '../middleware/auth.js'
 import { getFonts, createFont, deleteFont } from '../db.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-const FONTS_DIR = join(__dirname, '..', 'uploads', 'fonts')
-
-if (!existsSync(FONTS_DIR)) mkdirSync(FONTS_DIR, { recursive: true })
+import { FONTS_DIR } from '../paths.js'
 
 const ALLOWED_EXTS = new Set(['.ttf', '.otf', '.woff2'])
 

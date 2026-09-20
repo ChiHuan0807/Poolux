@@ -1,56 +1,42 @@
 import { Router } from 'express'
 import multer from 'multer'
 import sharp from 'sharp'
-import { join, dirname } from 'path'
-import { fileURLToPath } from 'url'
-import { mkdirSync, existsSync, unlinkSync } from 'fs'
+import { join } from 'path'
+import { existsSync, unlinkSync } from 'fs'
 import { authMiddleware } from '../middleware/auth.js'
 import {
   getWorksImages, createWorksImage, deleteWorksImage, reorderWorksImages,
 } from '../db.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-function extractPath(urlOrPath) {
-  if (!urlOrPath) return null
-  try {
-    if (/^https?:\/\//.test(urlOrPath)) {
-      const u = new URL(urlOrPath)
-      var pathname = u.pathname.startsWith('/') ? u.pathname.slice(1) : u.pathname
-    } else if (urlOrPath.startsWith('/')) {
-      var pathname = urlOrPath.slice(1)
-    } else {
-      var pathname = urlOrPath
-    }
-    // 统一去掉 /api/uploads/ 前缀为 uploads/
-    return pathname.replace(/^api\//, '')
-  } catch { return null }
-}
+import { UPLOADS_DIR, uploadFilePath } from '../paths.js'
+import { IMAGE_EXTS, hasAllowedExt, safeUploadName, webpTargetName } from '../upload-files.js'
+import { normalizeAssetUrl } from '../safe-url.js'
 
 function deleteFile(urlOrPath) {
-  const rel = extractPath(urlOrPath)
-  if (!rel) return
-  const abs = join(__dirname, '..', rel)
+  const abs = uploadFilePath(urlOrPath)
+  if (!abs) return
   try { if (existsSync(abs)) unlinkSync(abs) } catch { /* ignore */ }
 }
 
 const router = Router()
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const dir = join(__dirname, '..', 'uploads')
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-    cb(null, dir)
-  },
-  filename: (_req, file, cb) => {
-    const ext = file.originalname.split('.').pop() || 'bin'
-    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`)
+  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+  // 文件名完全由服务端生成，客户端提供的 originalname 只用于判断扩展名
+  filename: (_req, file, cb) => cb(null, safeUploadName('works-', file.originalname, IMAGE_EXTS, '.webp')),
+})
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!hasAllowedExt(file.originalname, IMAGE_EXTS)) {
+      return cb(new Error('仅支持图片文件（JPG/PNG/GIF/WebP/BMP/TIFF/AVIF）'))
+    }
+    if (!String(file.mimetype || '').startsWith('image/')) {
+      return cb(new Error('文件类型不是图片'))
+    }
+    cb(null, true)
   },
 })
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } })
-
-const IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp']
 
 // GET /api/works — 公开
 router.get('/', (_req, res) => {
@@ -58,9 +44,12 @@ router.get('/', (_req, res) => {
 })
 
 // POST /api/works — 鉴权，创建
+// image_url 会被前台直接渲染成 <img src>，限定为站内路径或 http(s)
 router.post('/', authMiddleware, (req, res) => {
   try {
-    const result = createWorksImage(req.body)
+    const imageUrl = normalizeAssetUrl(req.body?.image_url, { label: '图片地址', required: true })
+    const sortOrder = Number(req.body?.sort_order)
+    const result = createWorksImage({ image_url: imageUrl, sort_order: Number.isFinite(sortOrder) ? sortOrder : 0 })
     res.json({ ok: true, id: result.lastInsertRowid })
   } catch (e) {
     res.status(400).json({ error: e.message })
@@ -86,21 +75,20 @@ router.delete('/:id', authMiddleware, (req, res) => {
   res.json({ ok: true })
 })
 
-// POST /api/works/upload — 鉴权，上传图片
+// POST /api/works/upload — 鉴权，上传图片（统一转 webp）
 router.post('/upload', authMiddleware, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: '未选择文件' })
+  const webpName = webpTargetName(req.file.filename)
+  const webpPath = join(req.file.destination, webpName)
   try {
-    if (IMAGE_MIMES.includes(req.file.mimetype)) {
-      const webpName = req.file.filename.replace(/\.\w+$/, '.webp')
-      const webpPath = join(req.file.destination, webpName)
-      await sharp(req.file.path).webp({ quality: 82 }).toFile(webpPath)
-      try { unlinkSync(req.file.path) } catch {}
-      res.json({ ok: true, path: `/api/uploads/${webpName}` })
-    } else {
-      res.json({ ok: true, path: `/api/uploads/${req.file.filename}` })
-    }
-  } catch {
-    res.json({ ok: true, path: `/api/uploads/${req.file.filename}` })
+    await sharp(req.file.path).rotate().webp({ quality: 82 }).toFile(webpPath)
+    try { unlinkSync(req.file.path) } catch { /* ignore */ }
+    res.json({ ok: true, path: `/api/uploads/${webpName}` })
+  } catch (err) {
+    // 转换失败不能把原始文件原样返回：伪装成图片的 SVG/HTML 会以原扩展名被访问
+    try { unlinkSync(req.file.path) } catch { /* ignore */ }
+    console.error('[works/upload] 转 webp 失败：', err)
+    res.status(400).json({ error: `图片解析失败，请确认文件是有效的图片（${err?.message || '未知原因'}）` })
   }
 })
 

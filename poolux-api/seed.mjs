@@ -19,25 +19,36 @@ try {
 } catch { /* 列已存在 */ }
 
 // --- 密码工具 ---
-function hashPassword(password, salt) {
-  return crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex')
+// 与 db.js 保持一致：迭代次数写进哈希串，旧格式（纯 hex）仍能登录后自动升级。
+// 以前这里固定 10000 次 PBKDF2 且密码写死为 'poolux2026'，
+// 源码公开就等于这批账号全部可被登录，现在改为环境变量或随机口令。
+const PBKDF2_ITERATIONS = 210000
+
+function hashPassword(password, salt, iterations = PBKDF2_ITERATIONS) {
+  const hash = crypto.pbkdf2Sync(password, salt, iterations, 64, 'sha512').toString('hex')
+  return `pbkdf2:sha512:${iterations}:${hash}`
 }
 
-function ensureUser(username, password, defaultAuthor) {
+const SEED_PASSWORD = (process.env.SEED_PASSWORD || '').trim()
+
+function ensureUser(username, defaultAuthor) {
   const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username)
   if (existing) {
     console.log(`[seed] 用户已存在: ${username}`)
     return
   }
+  // 不传 SEED_PASSWORD 时每个账号各生成一个随机口令，避免所有部署共用同一口令
+  const password = SEED_PASSWORD || crypto.randomBytes(12).toString('base64url')
   const salt = crypto.randomBytes(16).toString('hex')
-  const hash = hashPassword(password, salt)
-  db.prepare('INSERT INTO users (username, password_hash, salt, default_author) VALUES (?, ?, ?, ?)').run(username, hash, salt, defaultAuthor)
+  db.prepare("INSERT INTO users (username, password_hash, salt, default_author, password_changed_at) VALUES (?, ?, ?, ?, strftime('%s','now'))")
+    .run(username, hashPassword(password, salt), salt, defaultAuthor)
   console.log(`[seed] 已创建用户: ${username} (默认作者: ${defaultAuthor})`)
+  if (!SEED_PASSWORD) console.log(`[seed]   ↳ 随机口令（仅本次打印）: ${password}`)
 }
 
-ensureUser('池焕不是迟缓', 'poolux2026', '@池焕不是迟缓')
-ensureUser('山荼-skat', 'poolux2026', '@山荼-skat')
-ensureUser('Fmkli', 'poolux2026', '')
+ensureUser('池焕不是迟缓', '@池焕不是迟缓')
+ensureUser('山荼-skat', '@山荼-skat')
+ensureUser('Fmkli', '')
 
 // --- 资源数据 ---
 const resources = [
