@@ -2,7 +2,7 @@
 // 放在 dist-server 而不是 dist：dist 只装前端文件，整包覆盖网站根目录时不会碰到后端与数据。
 // 用法：npm run package:api
 import { execFileSync } from 'child_process'
-import { existsSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs'
+import { existsSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { copyApi, DEST } from './copy-api.mjs'
 import { findBackslashEntries, listZipNames } from './lib-zip.mjs'
@@ -30,7 +30,8 @@ writeFileSync(
 )
 console.log(`[package-api] 构建标识: ${buildId}（${FEATURES.join('、')}）`)
 
-if (existsSync(ZIP)) rmSync(ZIP, { force: true })
+// 旧包必须真正删掉：Windows + Node 24 上 rmSync 会静默失败，改用 unlinkSync
+if (existsSync(ZIP)) unlinkSync(ZIP)
 
 const topLevel = readdirSync(DEST)
 if (topLevel.length === 0) {

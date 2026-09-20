@@ -4,9 +4,10 @@
 // dist/ 里只有前端文件（没有 poolux-api、没有 data.db），所以覆盖解压到网站根目录是安全的。
 // 用法：npm run build 之后执行 npm run package:web
 import { execFileSync } from 'child_process'
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { assertNoForbidden, findBackslashEntries, listZipNames } from './lib-zip.mjs'
+import { pruneDebugArtifacts } from './lib-dist-prune.mjs'
 
 const ROOT = join(import.meta.dirname, '..')
 const SRC = join(ROOT, 'dist')
@@ -21,6 +22,9 @@ if (!existsSync(SRC)) {
   process.exit(1)
 }
 
+// 单独跑 npm run package:web 时也要保证干净：把 public/ 里带过来的本机调试页删掉
+pruneDebugArtifacts(SRC)
+
 const topLevel = readdirSync(SRC)
 if (topLevel.length === 0) {
   console.error('[package-web] dist/ 是空的，请先执行 npm run build')
@@ -31,7 +35,8 @@ if (topLevel.length === 0) {
 assertNoForbidden([...topLevel.map((n) => `${n}/`), ...topLevel], FORBIDDEN, 'package-web')
 
 mkdirSync(OUT_DIR, { recursive: true })
-if (existsSync(ZIP)) rmSync(ZIP, { force: true })
+// 旧包必须真正删掉：Windows + Node 24 上 rmSync 会静默失败，改用 unlinkSync
+if (existsSync(ZIP)) unlinkSync(ZIP)
 
 console.log('[package-web] 正在压缩…')
 try {
