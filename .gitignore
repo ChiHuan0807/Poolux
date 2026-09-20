@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-server
 dist-offline
 dist-ssr
 android
@@ -17,6 +18,11 @@ app-release-local.apk
 *.local
 poolux-api/apk-jobs
 poolux-api/data.db
+poolux-api/data.db-wal
+poolux-api/data.db-shm
+# 服务端数据：上传的图片/字体，以及服务器密钥，永远不要提交
+poolux-api/uploads/
+poolux-api/.env
 
 # Editor directories and files
 .vscode/*
@@ -37,6 +43,21 @@ backup/source/
 .edge-final-check/
 .vite/
 .trae/
+
+# 本地调试产物：一次性脚本、探针页面、测试图，都不要提交
+.tmp-*/
+.tmp-*.html
+.figma-check.txt
+bflayers.html
+bfmatrix.html
+poolux-api/tmp-*
+public/bfcheck.html
+public/bftest.html
+public/tmp-*.png
+test_base.png
+test_source.png
+editable_text_poster.png
+editable_text_poster_small.jpg
 
 # 超大字体源包（网站实际用 public/fonts，不必上传 GitHub）
 font/
