@@ -205,6 +205,8 @@ function RenderLayer({ layer }: { layer: Layer }) {
   if (layer.type === 'image' && layer.image_url) {
     const w = css['width'] || '100%'
     const h = css['height'] || '100%'
+    const borderRadius = css['border-radius'] || undefined
+    const clipPath = borderRadius ? `inset(0 round ${borderRadius})` : undefined
     const containerStyle: React.CSSProperties = {
       position: 'absolute',
       left: css['left'] || '0',
@@ -215,8 +217,22 @@ function RenderLayer({ layer }: { layer: Layer }) {
       transform: css['transform'] || undefined,
       filter: css['filter'] || undefined,
       overflow: 'hidden',
+      borderRadius,
+      clipPath,
+      WebkitClipPath: clipPath,
+      isolation: 'isolate',
+      contain: 'paint',
     }
-    return <img src={layer.image_url} alt="" draggable={false} style={{ ...containerStyle, objectFit: 'cover', pointerEvents: 'none' }} />
+    return (
+      <div style={containerStyle}>
+        <img
+          src={layer.image_url}
+          alt=""
+          draggable={false}
+          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', pointerEvents: 'none' }}
+        />
+      </div>
+    )
   }
 
   const style = useMemo(() => {
@@ -237,12 +253,17 @@ function DeviceViewport({ device, maxH = 340 }: { device: DeviceConfig; maxH?: n
   const displayH = Math.round(height * scale)
   const sorted = useMemo(() => [...layers].sort((a, b) => (a.z_index ?? 0) - (b.z_index ?? 0)), [layers])
 
+  const deviceBorderRadius = Math.round(corner_radius * scale)
+  const deviceClipPath = `inset(0 round ${deviceBorderRadius}px)`
+
   return (
     <div style={{
       position: 'relative',
       width: displayW,
       height: displayH,
-      borderRadius: Math.round(corner_radius * scale),
+      borderRadius: deviceBorderRadius,
+      clipPath: deviceClipPath,
+      WebkitClipPath: deviceClipPath,
       overflow: 'hidden',
       background: background || '#FFFFFF',
       flexShrink: 0,
@@ -546,7 +567,7 @@ export function ComponentAdmin() {
           <div className="rounded-2xl p-4 space-y-3" style={{ background: 'var(--bg-secondary)', boxShadow: 'var(--shadow-card)' }}>
             <label className="block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>模板名称</label>
             <input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}
-              placeholder="如：「Canopy UI」表盘"
+              placeholder="如：「时语」表盘"
               className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
               style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
           </div>

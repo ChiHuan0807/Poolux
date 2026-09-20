@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite",
     "prebuild": "node -e \"const{readdirSync,unlinkSync,rmdirSync,existsSync,statSync}=require('fs');const{join}=require('path');function rmrf(d){if(!existsSync(d))return;readdirSync(d).forEach(f=>{const p=join(d,f);try{(statSync(p).isDirectory()?rmrf:unlinkSync)(p)}catch(e){console.error('prebuild: cannot delete',p,e.message)}});rmdirSync(d)}rmrf('dist')\"",
-    "build": "tsc -b && vite build && node scripts/copy-api.mjs && node scripts/backup.mjs",
+    "build": "tsc -b && vite build && node scripts/package-api.mjs && node scripts/package-web.mjs && node scripts/backup.mjs",
     "build:offline": "vite build --mode offline",
+    "package:api": "node scripts/package-api.mjs",
+    "package:web": "node scripts/package-web.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "check": "tsc -b --noEmit"
@@ -20,11 +22,14 @@
     "@capacitor/status-bar": "^6.0.3",
     "@remixicon/react": "^4.9.0",
     "clsx": "^2.1.1",
+    "html-to-image": "^1.11.13",
     "jszip": "^3.10.1",
     "lucide-react": "^0.511.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.3.0",
+    "remark-gfm": "^4.0.1",
     "tailwind-merge": "^3.0.2",
     "zustand": "^5.0.3"
   },

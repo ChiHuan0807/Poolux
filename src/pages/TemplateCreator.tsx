@@ -1,9 +1,12 @@
-import { useState, useMemo, useRef, useCallback, useEffect } from 'react'
+import { Fragment, useState, useMemo, useRef, useCallback, useEffect } from 'react'
 import { apiFetch, apiUploadTo, API_BASE } from '@/lib/api'
-import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssTranslation, resolveTextStyle, stripTranslateTransform } from '@/lib/templateTextStyle'
+import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssTranslation, resolveTextStyle, stripTranslateTransform, textStrokeLineWidth } from '@/lib/templateTextStyle'
+import { snapToEdges } from '@/lib/snapToEdges'
+import { resolveBackdropBlurPx, resolveSvgIntrinsicSize, svgMaskImageUrl, svgMaskStyle } from '@/lib/watchFaceKit'
+import { BackdropBlurOverlay } from '@/components/BackdropBlurOverlay'
 import {
   Trash2, GripVertical, Save, Image, Shapes, Group,
-  ChevronDown, ChevronRight, Monitor, X, Type, Upload,
+  ChevronDown, ChevronRight, Monitor, X, Type, Upload, FlipHorizontal2, FlipVertical2, RotateCcw,
 } from 'lucide-react'
 
 /* ══════════════════════════════════════════════════════════
@@ -34,17 +37,25 @@ interface TemplateLayer {
   allow_user_upload?: boolean; image_url?: string; adjustments?: ImageAdjustments
   show_on_client?: boolean  // 是否将管理端配置的图片上传服务器并展示给用户
   admin_preview_url?: string  // 仅存在于管理端内存，不写入模板数据
+  mask_svg?: string  // 图片图层的 SVG 形状遮罩（SVG 源码）：用户上传的图片只显示在这个 SVG 画出的形状里
   css_width?: number; css_height?: number  // 图层结构化宽高（覆盖样式代码中的宽高）
   css_position_code?: string  // CSS 定位代码原文（用于 textarea 回显）
   effects?: LayerEffects
-  group_id?: string   // 成组 ID
+  group_id?: string   // 「多图层同图」的关联 ID：同 ID 的图层在用户端共用同一张上传图片
   visible_in_export?: boolean  // 导出时是否显示
+  flip_horizontal?: boolean
+  flip_vertical?: boolean
   color_mode?: 'fixed' | 'picker'; color?: string; picker_default?: 'dark' | 'light'
   // text layer
   text_content?: string; font_family?: string; font_weight?: string
   font_size?: number; line_height?: number; letter_spacing?: number
   text_color?: string; text_align?: string  // 'left' | 'center' | 'right'
   text_vertical_align?: string  // 'top' | 'middle' | 'bottom'
+  text_stroke_type?: 'outset' | 'center' | 'inset'  // 描边位置：外/居中/内
+  text_stroke_size?: number  // 描边粗细 px，0 或未设置表示无描边
+  text_stroke_color_mode?: 'fixed' | 'picker'  // 描边颜色是否独立自动取色
+  text_stroke_color?: string  // 描边固定颜色
+  text_stroke_picker_default?: 'dark' | 'light'  // 描边自动取色的深浅偏好
 }
 
 interface FontRecord {
@@ -54,18 +65,34 @@ interface FontRecord {
 
 interface DeviceWithLayers extends DeviceConfig { layers: TemplateLayer[] }
 
+interface PreviewLayerSourceState {
+  imageUrl: string
+  naturalSize: { width: number; height: number }
+  position: { x: number; y: number }
+  scale: number
+  rotation: number
+}
+
 const DEVICE_PRESETS: DeviceConfig[] = [
   { name: '小米手环 Pro', width: 336, height: 480, borderRadius: 48 },
   { name: '小米手环 10', width: 212, height: 520, borderRadius: 108 },
   { name: 'REDMI Watch', width: 432, height: 514, borderRadius: 108 },
 ]
 
+/** 能承载「用户上传图片」的图层：只有这些层才谈得上「多图层同图」。 */
+function isUserImageLayer(layer: TemplateLayer): boolean {
+  return layer.allow_user_upload === true
+}
+
+/** 「图片参数调整」的滑杆规格。
+ *  上限一律放开（max: Infinity）：这些都是模板自带的固定效果，上限只会挡住作者想要的强度，
+ *  真正需要限制的地方（例如用户端的模糊滑杆）另由 blur_max 单独控制。 */
 const ADJ_SPECS: { key: keyof ImageAdjustments; label: string; min: number; max: number; step: number; unit: string }[] = [
-  { key: 'rotation', label: '旋转角度', min: 0, max: 360, step: 1, unit: '°' },
-  { key: 'scale', label: '放大倍数', min: 0.1, max: 5, step: 0.1, unit: 'x' },
-  { key: 'blur', label: '模糊', min: 0, max: 50, step: 1, unit: 'px' },
-  { key: 'contrast', label: '对比度', min: 0, max: 200, step: 1, unit: '%' },
-  { key: 'brightness', label: '亮度', min: 0, max: 200, step: 1, unit: '%' },
+  { key: 'rotation', label: '旋转角度', min: 0, max: Number.POSITIVE_INFINITY, step: 1, unit: '°' },
+  { key: 'scale', label: '放大倍数', min: 0.1, max: Number.POSITIVE_INFINITY, step: 0.1, unit: 'x' },
+  { key: 'blur', label: '模糊', min: 0, max: Number.POSITIVE_INFINITY, step: 1, unit: 'px' },
+  { key: 'contrast', label: '对比度', min: 0, max: Number.POSITIVE_INFINITY, step: 1, unit: '%' },
+  // 「亮度」已下线：新模板不再写入 brightness，但存量模板里已有值的渲染仍然保留（见 watchFaceKit.resolveImageFx）
 ]
 
 /* ══════════════════════════════════════════════════════════
@@ -74,6 +101,14 @@ const ADJ_SPECS: { key: keyof ImageAdjustments; label: string; min: number; max:
 
 let _idCounter = 0
 const nextId = () => `l_${Date.now()}_${_idCounter++}`
+
+/** 图层数组按“最上层 → 最下层”存储，z_index 只作为该顺序的派生值。 */
+function normalizeLayerStack<T extends { z_index: number }>(layers: T[]): T[] {
+  return layers.map((layer, index) => ({
+    ...layer,
+    z_index: layers.length - 1 - index,
+  }))
+}
 
 function getAdjDefault(key: keyof ImageAdjustments) {
   if (key === 'rotation') return 0; if (key === 'scale') return 1; if (key === 'blur') return 0; return 100
@@ -122,6 +157,11 @@ function toReactStyleKey(property: string): string {
     .replace('-', '')
 }
 
+function getFlipTransform(layer: Pick<TemplateLayer, 'flip_horizontal' | 'flip_vertical'>, transform?: string): string | undefined {
+  const flip = `${layer.flip_horizontal ? ' scaleX(-1)' : ''}${layer.flip_vertical ? ' scaleY(-1)' : ''}`
+  return transform || flip ? `${transform || ''}${flip}`.trim() : undefined
+}
+
 /** 交给浏览器 CSSOM 解析，避免 url()、渐变或引号中的分号破坏声明。 */
 function parseInlineCss(raw: string): React.CSSProperties {
   if (/^\s*</.test(raw)) return {}
@@ -168,43 +208,18 @@ function resolveLayerPreviewStyle(layer: TemplateLayer, fallback: React.CSSPrope
   if (HORIZONTAL_POSITION_KEYS.some(key => explicitRecord[key] != null)) delete resolvedFallback.left
   if (VERTICAL_POSITION_KEYS.some(key => explicitRecord[key] != null)) delete resolvedFallback.top
 
+  // 背景模糊统一由毛玻璃 overlay 渲染（模糊半径见 resolveBackdropBlurPx）；
+  // 留在 wrapper 上会因 clip-path / opacity 变成 Backdrop Root 而失效，导出也复现不了
+  delete explicitRecord.backdropFilter
+  delete explicitRecord.WebkitBackdropFilter
+
   return { ...resolvedFallback, ...explicitStyle }
 }
 
-/** 从 SVG 标签中提取实际渲染尺寸（用于居中计算和 wrapper 尺寸） */
+/** 从 SVG 标签中提取实际渲染尺寸（用于居中计算和 wrapper 尺寸）。
+ *  规则与用户端预览/导出共用 resolveSvgIntrinsicSize，三处尺寸必须一致。 */
 function parseSvgDimensions(svg: string, deviceW: number, deviceH: number): { w: number; h: number } {
-  // 1. 尝试提取 width/height 属性
-  const wMatch = svg.match(/width="([^"]+)"/i)
-  const hMatch = svg.match(/height="([^"]+)"/i)
-  const parseDim = (val: string | undefined, ref: number): number => {
-    if (!val) return 0
-    if (val.endsWith('%')) return ref * parseFloat(val) / 100
-    return parseFloat(val) || 0
-  }
-  const aw = parseDim(wMatch?.[1], deviceW)
-  const ah = parseDim(hMatch?.[1], deviceH)
-  if (aw > 0 && ah > 0) return { w: aw, h: ah }
-  if (aw > 0) return { w: aw, h: aw }  // width-only → 正方形
-  if (ah > 0) return { w: ah, h: ah }
-
-  // 2. 尝试 viewBox
-  const vb = svg.match(/viewBox="([^"]+)"/i)
-  if (vb) {
-    const parts = vb[1].trim().split(/[\s,]+/).map(Number)
-    if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
-      // viewBox 与设备尺寸匹配 → 直接用设备尺寸
-      if (Math.abs(parts[2] - deviceW) < 1 && Math.abs(parts[3] - deviceH) < 1) {
-        return { w: deviceW, h: deviceH }
-      }
-      // 用 viewBox 宽高比，限制在设备尺寸内
-      const aspect = parts[2] / parts[3]
-      if (aspect >= 1) return { w: Math.min(deviceW, deviceH * aspect), h: Math.min(deviceH, deviceW / aspect) }
-      return { w: Math.min(deviceW, deviceH * aspect), h: Math.min(deviceH, deviceW / aspect) }
-    }
-  }
-
-  // 3. 默认 100×100
-  return { w: 100, h: 100 }
+  return resolveSvgIntrinsicSize(svg, deviceW, deviceH)
 }
 
 /** 从 CSS 字符串中提取 left/top/width/height（px 值，用于对齐计算） */
@@ -297,39 +312,70 @@ function writeDraggedPosition(layer: TemplateLayer, x: number, y: number): Pick<
   }
 }
 
-/** 从 CSS 字符串中提取第一个颜色值（用于 SVG/Shape 图层默认颜色） */
-function extractCssColor(css: string): string | null {
-  // 按优先级匹配：background-color, background, color, fill, stroke
-  const props = ['background-color', 'background', 'color', 'fill', 'stroke']
-  for (const prop of props) {
-    const re = new RegExp(`${prop}\\s*:\\s*([^;]+)`, 'i')
-    const m = css.match(re)
-    if (m) {
-      const val = m[1].trim()
-      // 跳过 currentColor、transparent、url()、linear-gradient 等
-      if (/currentcolor|transparent|url\(|gradient|inherit|initial|unset/i.test(val)) continue
-      // 提取 hex/rgb/rgba/hsl/named color
-      const colorMatch = val.match(/(#[0-9a-fA-F]{3,8}|rgba?\\([^)]+\\)|hsla?\\([^)]+\\))/)
-      if (colorMatch) return colorMatch[0]
+/** 将拖拽缩放后的文本框尺寸写入结构化字段和定位 CSS，保证预览、保存、导出使用同一尺寸。 */
+function writeTextBoxSize(layer: TemplateLayer, x: number, y: number, width: number, height: number): Partial<TemplateLayer> {
+  const position = writeDraggedPosition(layer, x, y)
+  const positionCss = parseCssDeclarations(position.css_position_code || '')
+  positionCss.width = `${Math.round(width)}px`
+  positionCss.height = `${Math.round(height)}px`
+  return {
+    ...position,
+    css_width: Math.round(width),
+    css_height: Math.round(height),
+    css_position_code: serializeCssDeclarations(positionCss),
+  }
+}
+
+/** 从 CSS 中提取用于固定模式的完整颜色或渐变。 */
+function extractCssPaint(css: string): string | null {
+  const declarations = getCssDeclarationText(css)
+  if (!declarations) return null
+
+  // 优先保留源码写法，避免 CSSOM 把 rgba(..., 1) 规范化成 rgb(...)。
+  const properties = ['background-image', 'background-color', 'background', 'color', 'fill', 'stroke']
+  for (const property of properties) {
+    const match = declarations.match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+)`, 'i'))
+    const paint = match?.[1]?.trim()
+    if (!paint || /^(none|currentcolor|transparent|inherit|initial|unset)$/i.test(paint) || /^url\(/i.test(paint)) continue
+    if (CSS.supports(property, paint)) return paint
+  }
+
+  const style = document.createElement('div').style
+  style.cssText = declarations
+  const candidates = [
+    style.backgroundImage,
+    style.backgroundColor,
+    style.color,
+    style.fill,
+    style.stroke,
+  ]
+  for (const value of candidates) {
+    const paint = value.trim()
+    if (paint && !/^(none|currentcolor|transparent|inherit|initial|unset)$/i.test(paint) && !/^url\(/i.test(paint)) {
+      return paint
     }
   }
-  return null
+
+  // CSSOM 会忽略少数非标准导出格式，保留声明文本作为兼容回退。
+  const fallback = declarations.match(/(?:background(?:-image|-color)?|color|fill|stroke)\s*:\s*([^;]+)/i)?.[1]?.trim()
+  if (!fallback || /^(none|currentcolor|transparent|inherit|initial|unset)$/i.test(fallback) || /^url\(/i.test(fallback)) return null
+  return fallback
 }
 
 /** 从 SVG 内容中提取 fill / stroke 颜色（跳过 none / currentColor / url(#...)） */
 function extractSvgColor(svg: string): string | null {
-  // 匹配 fill="..." 或 stroke="..."（属性形式）
-  const attrRe = /(?:fill|stroke)\s*=\s*"([^"]+)"/gi
+  // 匹配 fill="..." / fill='...' 或 stroke="..." / stroke='...'（属性形式）
+  const attrRe = /(?:fill|stroke)\s*=\s*(["'])(.*?)\1/gi
   let m: RegExpExecArray | null
   while ((m = attrRe.exec(svg)) !== null) {
-    const val = m[1].trim()
+    const val = m[2].trim()
     if (/^(none|currentColor|url\s*\(|transparent)$/i.test(val)) continue
     if (/^#[0-9a-fA-F]{3,8}$/.test(val) || /^rgba?\s*\(/.test(val) || /^hsla?\s*\(/.test(val)) return val
   }
   // 匹配内联 style 中的 fill:... 或 stroke:...
-  const styleRe = /style\s*=\s*"([^"]*)"/gi
+  const styleRe = /style\s*=\s*(["'])(.*?)\1/gi
   while ((m = styleRe.exec(svg)) !== null) {
-    const style = m[1]
+    const style = m[2]
     const colorMatch = style.match(/(?:fill|stroke)\s*:\s*([^;]+)/i)
     if (colorMatch) {
       const val = colorMatch[1].trim()
@@ -341,6 +387,20 @@ function extractSvgColor(svg: string): string | null {
   return null
 }
 
+/** 原生颜色选择器只接受 #RRGGBB；将 SVG/CSS 中的合法颜色统一为该格式。 */
+function toColorInputValue(color?: string): string {
+  if (!color || !CSS.supports('color', color)) return '#8884FF'
+  const context = document.createElement('canvas').getContext('2d')
+  if (!context) return '#8884FF'
+  context.fillStyle = color
+  const normalized = context.fillStyle
+  if (/^#[0-9a-f]{6}$/i.test(normalized)) return normalized
+  if (/^#[0-9a-f]{8}$/i.test(normalized)) return normalized.slice(0, 7)
+  const rgb = normalized.match(/^rgba?\(\s*(\d+)\D+(\d+)\D+(\d+)/i)
+  if (!rgb) return '#8884FF'
+  return `#${rgb.slice(1, 4).map(value => Number(value).toString(16).padStart(2, '0')).join('')}`
+}
+
 /* ══════════════════════════════════════════════════════════
    可拖拽数值输入 (ScrubInput)
    ══════════════════════════════════════════════════════════ */
@@ -348,12 +408,22 @@ function extractSvgColor(svg: string): string | null {
 function ScrubInput({
   value, min, max, step, unit, onChange,
 }: {
-  value: number; min: number; max: number; step: number; unit: string
+  /** 上下限都可省略：省略（或传非有限值）表示这一项不设限，输入框也不再写 min/max 属性 */
+  value: number; min?: number; max?: number; step: number; unit: string
   onChange: (v: number) => void
 }) {
   const dragging = useRef(false)
   const startX = useRef(0)
   const startVal = useRef(0)
+  const hasMin = typeof min === 'number' && Number.isFinite(min)
+  const hasMax = typeof max === 'number' && Number.isFinite(max)
+  /** 只对「确实设了限」的那一侧夹取，另一侧原样放行 */
+  const clamp = (v: number) => {
+    let next = v
+    if (hasMin) next = Math.max(min as number, next)
+    if (hasMax) next = Math.min(max as number, next)
+    return next
+  }
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0) return
@@ -369,15 +439,14 @@ function ScrubInput({
     const dx = e.clientX - startX.current
     const steps = dx / 2
     const raw = startVal.current + steps * step
-    const clamped = Math.min(max, Math.max(min, Math.round(raw / step) * step))
-    onChange(clamped)
-  }, [min, max, step, onChange])
+    onChange(clamp(Math.round(raw / step) * step))
+  }, [hasMin, hasMax, min, max, step, onChange])
 
   const onPointerUp = useCallback(() => { dragging.current = false }, [])
 
   return (
-    <input type="number" min={min} max={max} step={step} value={value}
-      onChange={e => { const v = +e.target.value; if (!isNaN(v)) onChange(Math.min(max, Math.max(min, v))) }}
+    <input type="number" min={hasMin ? min : undefined} max={hasMax ? max : undefined} step={step} value={value}
+      onChange={e => { const v = +e.target.value; if (!isNaN(v)) onChange(clamp(v)) }}
       onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
       className="w-16 px-2 py-1 rounded-lg text-xs text-right outline-none font-mono cursor-ew-resize"
       style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
@@ -417,7 +486,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     if (!editTemplate?.devices) return []
     return editTemplate.devices.map((d: any) => ({
       name: d.name || '', width: d.width || 336, height: d.height || 480, borderRadius: d.corner_radius ?? 48,
-      layers: Array.isArray(d.layers) ? d.layers.map((l: any, i: number) => ({
+      layers: Array.isArray(d.layers) ? normalizeLayerStack(d.layers.map((l: any, i: number) => ({
         id: `l_${Date.now()}_${i}`, // 重新生成 ID
         name: l.name || '图层',
         type: l.type || 'color',
@@ -430,15 +499,18 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
         css_position_code: l.css_position_code || '',
         allow_user_upload: l.allow_user_upload ?? false,
         image_url: l.image_url || '',
+        mask_svg: l.mask_svg || '',
         show_on_client: l.show_on_client ?? true,
         admin_preview_url: '',
         adjustments: l.adjustments ? { ...DEFAULT_ADJUSTMENTS, ...l.adjustments } : undefined,
         effects: l.effects ? { ...DEFAULT_EFFECTS, ...l.effects } : { ...DEFAULT_EFFECTS },
         group_id: l.group_id,
         visible_in_export: l.visible_in_export ?? true,
-        color_mode: l.color_mode,
+        flip_horizontal: l.flip_horizontal ?? false,
+        flip_vertical: l.flip_vertical ?? false,
+        color_mode: l.color_mode ?? ((l.type === 'svg' || l.type === 'shape') ? 'picker' : l.type === 'text' ? 'fixed' : undefined),
         color: l.color,
-        picker_default: l.picker_default,
+        picker_default: l.picker_default ?? ((l.type === 'svg' || l.type === 'shape' || l.type === 'text') ? 'light' : undefined),
         text_content: l.text_content,
         font_family: l.font_family,
         font_weight: l.font_weight,
@@ -448,7 +520,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
         text_color: l.text_color,
         text_align: l.text_align,
         text_vertical_align: l.text_vertical_align,
-      })) : [],
+      }))) : [],
     }))
   }
 
@@ -457,6 +529,14 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
   const [showCustom, setShowCustom] = useState(false)
   const [customDev, setCustomDev] = useState<DeviceConfig>({ name: '', width: 300, height: 400, borderRadius: 0 })
   const [tplName, setTplName] = useState(editTemplate?.name || '')
+  // 用户端「效果-图片效果-模糊度」滑杆的上限（px），由管理端设置；旧模板没有这个字段时按 50
+  const [blurMax, setBlurMax] = useState<number>(() => {
+    const raw = Math.round(Number(editTemplate?.blur_max))
+    return Number.isFinite(raw) && raw > 0 ? Math.min(200, Math.max(1, raw)) : 50
+  })
+  // 模板库封面（LOGO）：必须是 1:1 方图，由管理员上传；预览图不再自动生成
+  const [coverImage, setCoverImage] = useState(editTemplate?.preview_image || '')
+  const [coverUploading, setCoverUploading] = useState(false)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [dragIdx, setDragIdx] = useState<number | null>(null)
   const [msg, setMsg] = useState('')
@@ -524,8 +604,18 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
 
   // 预览区拖拽状态 — 使用 ref 避免依赖变更导致事件监听器重建（修复粘滞光标 bug）
   interface DragEntry { id: string; origX: number; origY: number }
+  type ResizeDirection = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw'
+  interface TextResizeState {
+    layerId: string
+    direction: ResizeDirection
+    startX: number
+    startY: number
+    rect: { x: number; y: number; w: number; h: number }
+  }
   const canvasDragRef = useRef<{ entries: DragEntry[]; startX: number; startY: number } | null>(null)
+  const textResizeRef = useRef<TextResizeState | null>(null)
   const [isDragging, setIsDragging] = useState(false)
+  const [isTextResizing, setIsTextResizing] = useState(false)
   const [snapGuides, setSnapGuides] = useState<{ type: 'h' | 'v'; pos: number; label: string }[]>([])
   const viewportRef = useRef<HTMLDivElement>(null)
   const previewContainerRef = useRef<HTMLDivElement>(null)
@@ -543,6 +633,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
   }, [])
 
   const device = devices[selDev]
+
   const layers: TemplateLayer[] = device?.layers ?? []
   // ref 必须在 layers 之后声明，否则 useRef(layers) 会触发 const TDZ 错误
   const layersRef = useRef<TemplateLayer[]>(layers)
@@ -602,9 +693,9 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     return () => window.removeEventListener('keydown', onKey)
   }, []) // 稳定 — 全部用 ref
 
-  /* ── 多选 ── */
+  /* ── 多选：Ctrl/Cmd+点击 或 Shift+点击 都能加选/取消 ── */
   const handleLayerSelect = useCallback((id: string, e: React.MouseEvent) => {
-    if (e.shiftKey) {
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
       setSelectedIds(prev => {
         const next = new Set(prev)
         if (next.has(id)) next.delete(id)
@@ -617,7 +708,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
   }, [])
 
   const handleCanvasSelect = useCallback((id: string, e: React.MouseEvent) => {
-    if (e.shiftKey) {
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
       setSelectedIds(prev => {
         const next = new Set(prev)
         if (next.has(id)) next.delete(id)
@@ -710,25 +801,53 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     // 图形图层：自动从 CSS 代码提取 background-color 作为默认
     const defaultColor = type === 'svg'
       ? extractSvgColor(defaultCss)
-      : type !== 'image' ? (extractCssColor(defaultCss) || undefined) : undefined
+      : type !== 'image' ? (extractCssPaint(defaultCss) || undefined) : undefined
     const nl: TemplateLayer = {
       id: nextId(), type, name: type === 'image' ? '图片图层' : type === 'svg' ? 'SVG图层' : type === 'text' ? '文字图层' : '图形图层',
       css_code: defaultCss,
-      z_index: layers.length, x: 0, y: 0,
+      z_index: 0, x: 0, y: 0,
       ...(type === 'image' ? { allow_user_upload: true, show_on_client: true, adjustments: { ...DEFAULT_ADJUSTMENTS }, image_url: '' }
-        : type === 'text' ? { text_content: '双击编辑文字', font_family: '', font_weight: '400', font_size: 24, line_height: 1.4, letter_spacing: 0, text_color: '#FFFFFF', text_vertical_align: undefined }
-        : { color_mode: 'fixed' as const, color: defaultColor }),
+        : type === 'text' ? {
+          text_content: '双击编辑文字', font_family: '', font_weight: '400', font_size: 24,
+          line_height: 1.4, letter_spacing: 0, text_color: '#FFFFFF', text_vertical_align: undefined,
+          color_mode: 'fixed' as const, picker_default: 'light' as const,
+          css_width: 200, css_height: 34,
+        }
+        : { color_mode: 'picker' as const, color: defaultColor, picker_default: 'light' as const }),
       effects: { ...DEFAULT_EFFECTS },
     }
-    setDeviceLayers(prev => [nl, ...prev]); setExpandedId(nl.id)
+    setDeviceLayers(prev => normalizeLayerStack([nl, ...prev])); setExpandedId(nl.id)
   }
   const updateLayer = (id: string, patch: Partial<TemplateLayer>) =>
     setDeviceLayers(prev => prev.map(l => l.id === id ? { ...l, ...patch } : l))
   const removeLayer = (id: string) => {
-    setDeviceLayers(prev => prev.filter(l => l.id !== id))
+    setDeviceLayers(prev => normalizeLayerStack(prev.filter(l => l.id !== id)))
     if (expandedId === id) setExpandedId(null)
     setSelectedIds(prev => { const next = new Set(prev); next.delete(id); return next })
   }
+  /* ── 多图层同图：选中的可上传图层共用同一张用户图片 ──
+     数据上仍然是给这些图层写同一个 group_id（用户端据此把一次上传分享给整组、
+     拖动时整组联动），但管理端不再有「组」这个概念：只有这一个按键 + 多选。
+     重新指定时要先把这些图层从旧关系里摘出来，否则旧同图集合会留下只有一个成员的残壳。 */
+  const linkSelectedLayers = useCallback(() => {
+    const targets = layersRef.current.filter(layer => selectedIds.has(layer.id) && isUserImageLayer(layer))
+    if (targets.length < 2) {
+      setMsg('请先用 Ctrl+点击 选中至少两个「允许用户上传图片」的图层')
+      return
+    }
+    const linkId = `g_${Date.now()}`
+    const targetIds = new Set(targets.map(layer => layer.id))
+    setDeviceLayers(prev => prev.map(layer => (targetIds.has(layer.id) ? { ...layer, group_id: linkId, group_name: undefined } : layer)))
+    setExpandedId(null)
+    setMsg(`已将 ${targets.length} 个图层设为同一张图`)
+  }, [selectedIds, setDeviceLayers])
+
+  const unlinkSelectedLayers = useCallback(() => {
+    const targetIds = new Set(layersRef.current.filter(layer => selectedIds.has(layer.id) && layer.group_id).map(layer => layer.id))
+    if (targetIds.size === 0) return
+    setDeviceLayers(prev => prev.map(layer => (targetIds.has(layer.id) ? { ...layer, group_id: undefined, group_name: undefined } : layer)))
+    setMsg('已取消同图')
+  }, [selectedIds, setDeviceLayers])
 
   /* ── 字体上传 ── */
   const handleFontUpload = async (file: File, isVariable: boolean) => {
@@ -751,30 +870,30 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     }
   }
 
-  /* ── Delete 键删除选中图层 + 成组快捷键 ── */
+  /* ── Delete 键删除选中图层 + 同图快捷键 ── */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName
       const isInput = tag === 'INPUT' || tag === 'TEXTAREA'
       const isMod = e.ctrlKey || e.metaKey
 
-      // Ctrl+G → 成组
-      if (isMod && e.key === 'g' && !e.shiftKey && selectedIds.size > 1 && !isInput) {
+      const key = e.key.toLowerCase()
+      // Ctrl+G → 多图层同图
+      if (isMod && key === 'g' && !e.shiftKey && selectedIds.size > 1 && !isInput) {
         e.preventDefault()
-        const gid = `g_${Date.now()}`
-        setDeviceLayers(prev => prev.map(l => selectedIds.has(l.id) ? { ...l, group_id: gid } : l))
+        linkSelectedLayers()
         return
       }
-      // Ctrl+Shift+G → 解组
-      if (isMod && e.key === 'g' && e.shiftKey && selectedIds.size > 0 && !isInput) {
+      // Ctrl+Shift+G → 取消同图
+      if (isMod && key === 'g' && e.shiftKey && selectedIds.size > 0 && !isInput) {
         e.preventDefault()
-        setDeviceLayers(prev => prev.map(l => selectedIds.has(l.id) ? { ...l, group_id: undefined } : l))
+        unlinkSelectedLayers()
         return
       }
 
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.size > 0 && !isInput) {
         e.preventDefault()
-        setDeviceLayers(prev => prev.filter(l => !selectedIds.has(l.id)))
+        setDeviceLayers(prev => normalizeLayerStack(prev.filter(l => !selectedIds.has(l.id))))
         setSelectedIds(new Set())
         if (expandedId && selectedIds.has(expandedId)) setExpandedId(null)
       }
@@ -796,7 +915,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [selectedIds, expandedId, setDeviceLayers])
+  }, [selectedIds, expandedId, setDeviceLayers, linkSelectedLayers, unlinkSelectedLayers])
 
   /* ── 列表拖拽排序 ── */
   const handleDragStart = (idx: number) => setDragIdx(idx)
@@ -804,8 +923,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     e.preventDefault(); if (dragIdx === null || dragIdx === idx) return
     setDeviceLayers(prev => {
       const r = [...prev]; const [m] = r.splice(dragIdx, 1); r.splice(idx, 0, m)
-      // index 0 = 列表最上面 = 最高层（z_index 最大）
-      return r.map((l, i) => ({ ...l, z_index: r.length - 1 - i }))
+      return normalizeLayerStack(r)
     }); setDragIdx(idx)
   }
   const handleDragEnd = () => setDragIdx(null)
@@ -936,20 +1054,124 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     }
   }, [isDragging, device, setDeviceLayers])
 
+  const startTextBoxResize = (layer: TemplateLayer, direction: ResizeDirection, e: React.MouseEvent) => {
+    if (!device) return
+    e.stopPropagation()
+    e.preventDefault()
+
+    const visualRect = getLayerVisualRect(layer, device.width, device.height)
+    const element = viewportRef.current?.querySelector(`[data-layer-id="${layer.id}"]`) as HTMLElement | null
+    const scale = previewScaleRef.current || 1
+    const bounds = element?.getBoundingClientRect()
+    const width = bounds ? bounds.width / scale : visualRect.w
+    const height = bounds ? bounds.height / scale : visualRect.h
+
+    textResizeRef.current = {
+      layerId: layer.id,
+      direction,
+      startX: e.clientX,
+      startY: e.clientY,
+      rect: { ...visualRect, w: width, h: height },
+    }
+    setSelectedIds(new Set([layer.id]))
+    setExpandedId(layer.id)
+    setIsTextResizing(true)
+  }
+
+  useEffect(() => {
+    if (!isTextResizing || !device) return
+    const MIN_TEXT_BOX_WIDTH = 16
+    const MIN_TEXT_BOX_HEIGHT = 8
+
+    const onMove = (e: MouseEvent | PointerEvent) => {
+      const resize = textResizeRef.current
+      if (!resize) return
+      const scale = previewScaleRef.current || 1
+      const dx = (e.clientX - resize.startX) / scale
+      const dy = (e.clientY - resize.startY) / scale
+      const { direction, rect } = resize
+
+      let x = rect.x
+      let y = rect.y
+      let width = rect.w
+      let height = rect.h
+
+      if (direction.includes('e')) width = Math.max(MIN_TEXT_BOX_WIDTH, rect.w + dx)
+      if (direction.includes('s')) height = Math.max(MIN_TEXT_BOX_HEIGHT, rect.h + dy)
+      if (direction.includes('w')) {
+        width = Math.max(MIN_TEXT_BOX_WIDTH, rect.w - dx)
+        x = rect.x + rect.w - width
+      }
+      if (direction.includes('n')) {
+        height = Math.max(MIN_TEXT_BOX_HEIGHT, rect.h - dy)
+        y = rect.y + rect.h - height
+      }
+
+      setDeviceLayers(prev => prev.map(current =>
+        current.id === resize.layerId
+          ? { ...current, ...writeTextBoxSize(current, x, y, width, height) }
+          : current,
+      ))
+    }
+    const onUp = () => {
+      textResizeRef.current = null
+      setIsTextResizing(false)
+    }
+    const onVisibility = () => {
+      if (document.hidden) onUp()
+    }
+
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [isTextResizing, device, setDeviceLayers])
+
+  /* ── 模板库封面（LOGO）上传：1:1 方图，由服务端裁成正方形 ── */
+  const handleCoverUpload = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      setMsg('封面仅支持图片文件')
+      return
+    }
+    setCoverUploading(true)
+    setMsg('')
+    try {
+      const result = await apiUploadTo('/api/templates/upload-logo', file)
+      if (!result?.path) throw new Error('封面图上传失败')
+      setCoverImage(result.path)
+      setMsg('封面已上传，保存模板后生效')
+    } catch (err: any) {
+      setMsg(err.message || '封面图上传失败')
+    } finally {
+      setCoverUploading(false)
+    }
+  }
+
   /* ── 保存 ── */
   const handleSave = async () => {
     if (saveInFlightRef.current) return
     if (!tplName.trim()) { setMsg('请输入模板名称'); return }
     if (devices.length === 0) { setMsg('请至少添加一个设备'); return }
     if (devices.every(d => d.layers.length === 0)) { setMsg('每个设备至少需要一个图层'); return }
+    if (!coverImage) { setMsg('请上传 1:1 的模板库 LOGO 封面'); return }
     saveInFlightRef.current = true
     setSaving(true)
     try {
       const payload = {
         name: tplName.trim(),
+        preview_image: coverImage,
+        blur_max: blurMax,
         devices: devices.map(d => ({
           name: d.name, width: d.width, height: d.height, corner_radius: d.borderRadius, background: d.background || '#111',
-          layers: d.layers.map(({ id, admin_preview_url: _adminPreviewUrl, ...rest }) => ({
+          layers: normalizeLayerStack(d.layers).map(({ id, admin_preview_url: _adminPreviewUrl, ...rest }) => ({
             ...rest,
             visible_in_export: rest.visible_in_export ?? true,
           })),
@@ -962,7 +1184,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
       } else {
         const result = await apiFetch('/api/templates', { method: 'POST', body: JSON.stringify(payload) })
         if (result?.id != null) persistedTemplateIdRef.current = Number(result.id)
-        setMsg('模板创建成功，后续保存将更新当前模板')
+        setMsg('模板创建成功')
       }
       onSaved?.()
     } catch (err: any) { setMsg(err.message || '保存失败') }
@@ -999,7 +1221,7 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
     const filter = filterParts.length > 0 ? filterParts.join(' ') : undefined
     const color = layer.type !== 'image' ? (layer.color_mode === 'fixed' ? layer.color : '#8884FF') : undefined
 
-    // 通用特殊效果
+    // 通用特殊效果（管理端「透明度 / 模糊」是所有图层通用的，文字图层也吃这一组值）
     const fx = layer.effects
     const fxOpacity = fx && fx.opacity < 100 ? fx.opacity / 100 : undefined
     const fxFilterParts: string[] = []
@@ -1012,18 +1234,21 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
 
     // 背景模糊：用内部 overlay div 实现，backdrop-filter 模糊图层下方内容
     // overlay 半透明背景确保 blur 效果可见（类似毛玻璃）
-    const backdropBlur = fx && fx.blur_type === 'backdrop' && fx.blur_value > 0 ? fx.blur_value : 0
+    // 模糊半径来自管理端「特殊效果」或图层自己的 backdrop-filter（见 resolveBackdropBlurPx），
+    // 与用户端预览、导出保持同一口径
+    const backdropBlur = resolveBackdropBlurPx(layer, {
+      ...parseCssDeclarations(layer.css_code || ''),
+      ...parseCssDeclarations(layer.css_position_code || ''),
+    })
 
-    // 选中边框样式
-    const selBorder = isSelected ? { outline: '2px solid var(--accent)', outlineOffset: '1px' } : {}
+    // outline 不遵守 border-radius，会在圆形图片外画出方框；用 box-shadow 作为选中框可跟随圆角。
+    const selBorder = isSelected ? { boxShadow: '0 0 0 2px var(--accent)' } : {}
 
     if (layer.type === 'svg') {
       const intrinsicDims = parseSvgDimensions(layer.css_code || '', device!.width, device!.height)
       const svgDims = { w: layer.css_width ?? intrinsicDims.w, h: layer.css_height ?? intrinsicDims.h }
       // SVG 的 mask-image：用 SVG 自身作为遮罩，使背景模糊仅作用于可见形状
-      const svgMaskUri = layer.css_code
-        ? `url('data:image/svg+xml,${encodeURIComponent(layer.css_code)}')`
-        : undefined
+      const svgMaskUri = svgMaskImageUrl(layer.css_code || '')
       const layerStyle = resolveLayerPreviewStyle(layer, {
         width: svgDims.w,
         height: svgDims.h,
@@ -1032,23 +1257,21 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
         filter: mergeFilter,
         opacity: fxOpacity,
       })
+      const previewLayerStyle = { ...layerStyle, transform: getFlipTransform(layer, layerStyle.transform as string) }
       return (
-        <div key={layer.id} data-layer-id={layer.id}
-          style={{ ...layerStyle, cursor: 'grab', ...selBorder }}
-          onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }}>
-          {/* 背景模糊 overlay — 使用 mask-image 裁剪到 SVG 可见形状 */}
+        <Fragment key={layer.id}>
+          {/* 背景模糊 overlay —— 必须是图层 wrapper 的兄弟节点（wrapper 带 clip-path / opacity / filter
+              时自己是 Backdrop Root，嵌进去模糊会整个消失），并用 mask-image 裁剪到 SVG 可见形状。 */}
           {backdropBlur > 0 && (
-            <div style={{
-              position: 'absolute', inset: 0,
-              backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`,
-              background: 'rgba(255,255,255,0.08)',
-              pointerEvents: 'none', zIndex: 0,
-              ...(svgMaskUri ? { maskImage: svgMaskUri, WebkitMaskImage: svgMaskUri } : {}),
-            }} />
+            <BackdropBlurOverlay box={previewLayerStyle} blurPx={backdropBlur} supported maskUrl={svgMaskUri} />
           )}
-          <div style={{ position: 'relative', zIndex: 1, pointerEvents: 'none', width: '100%', height: '100%' }}
-            dangerouslySetInnerHTML={{ __html: forceSvgFill(layer.css_code || '') }} />
-        </div>
+          <div data-layer-id={layer.id}
+            style={{ ...previewLayerStyle, cursor: 'grab', ...selBorder }}
+            onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }}>
+            <div style={{ position: 'relative', zIndex: 1, pointerEvents: 'none', width: '100%', height: '100%' }}
+              dangerouslySetInnerHTML={{ __html: forceSvgFill(layer.css_code || '') }} />
+          </div>
+        </Fragment>
       )
     }
     if (layer.type === 'shape') {
@@ -1059,15 +1282,18 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
         filter: mergeFilter,
         opacity: fxOpacity,
       })
+      const previewLayerStyle = { ...layerStyle, transform: getFlipTransform(layer, layerStyle.transform as string) }
       return (
-        <div key={layer.id} data-layer-id={layer.id}
-          style={{ ...layerStyle, cursor: 'grab', ...selBorder }}
-          onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }}>
-          {/* 背景模糊 overlay */}
+        <Fragment key={layer.id}>
+          {/* 背景模糊 overlay：与图层 wrapper 同级，裁剪沿用图层自己的 border-radius / clip-path，
+              圆角矩形不会糊成一整块方形（与用户端预览、导出同一份实现）。 */}
           {backdropBlur > 0 && (
-            <div style={{ position: 'absolute', inset: 0, backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
+            <BackdropBlurOverlay box={previewLayerStyle} blurPx={backdropBlur} supported />
           )}
-        </div>
+          <div data-layer-id={layer.id}
+            style={{ ...previewLayerStyle, cursor: 'grab', ...selBorder }}
+            onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }} />
+        </Fragment>
       )
     }
     if (layer.type === 'text') {
@@ -1086,27 +1312,67 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
         lineHeight: `${textStyle.lineHeightPx}px`,
         letterSpacing: textStyle.letterSpacingPx,
         color: textStyle.color,
+        WebkitTextStrokeWidth: textStyle.textStrokeWidth > 0 ? `${textStrokeLineWidth(textStyle)}px` : undefined,
+        WebkitTextStrokeColor: textStyle.textStrokeColor,
+        paintOrder: textStyle.textStrokeType === 'outset' ? 'stroke fill' : textStyle.textStrokeType === 'inset' ? 'fill stroke' : undefined,
         filter: mergeFilter,
         opacity: fxOpacity,
         textAlign: textStyle.textAlign,
         whiteSpace: 'pre-wrap',
         wordBreak: 'break-word',
       })
+      const handleSize = 8 / Math.max(previewScale, 0.1)
+      const handleOffset = handleSize / 2
+      const resizeHandles: { direction: ResizeDirection; style: React.CSSProperties; cursor: React.CSSProperties['cursor'] }[] = [
+        { direction: 'nw', style: { left: -handleOffset, top: -handleOffset }, cursor: 'nwse-resize' },
+        { direction: 'n', style: { left: '50%', top: -handleOffset, transform: 'translateX(-50%)' }, cursor: 'ns-resize' },
+        { direction: 'ne', style: { right: -handleOffset, top: -handleOffset }, cursor: 'nesw-resize' },
+        { direction: 'e', style: { right: -handleOffset, top: '50%', transform: 'translateY(-50%)' }, cursor: 'ew-resize' },
+        { direction: 'se', style: { right: -handleOffset, bottom: -handleOffset }, cursor: 'nwse-resize' },
+        { direction: 's', style: { left: '50%', bottom: -handleOffset, transform: 'translateX(-50%)' }, cursor: 'ns-resize' },
+        { direction: 'sw', style: { left: -handleOffset, bottom: -handleOffset }, cursor: 'nesw-resize' },
+        { direction: 'w', style: { left: -handleOffset, top: '50%', transform: 'translateY(-50%)' }, cursor: 'ew-resize' },
+      ]
       return (
-        <div key={`${layer.id}-${fontPreviewVersion}`} data-layer-id={layer.id}
-          style={{ ...layerStyle, cursor: 'grab', ...selBorder }}
-          onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }}>
+        <Fragment key={`${layer.id}-${fontPreviewVersion}`}>
+          {/* 背景模糊 overlay：糊的是文字框（和导出侧的取值口径一致） */}
           {backdropBlur > 0 && (
-            <div style={{ position: 'absolute', inset: '-4px', backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
+            <BackdropBlurOverlay box={layerStyle} blurPx={backdropBlur} supported />
           )}
-          <span style={{ position: 'relative', zIndex: 1, pointerEvents: 'none', width: '100%' }}>
-            {layer.text_content || ''}
-          </span>
-        </div>
+          <div data-layer-id={layer.id}
+            style={{ ...layerStyle, cursor: isTextResizing ? 'default' : 'grab', ...selBorder }}
+            onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }}>
+            <span style={{ position: 'relative', zIndex: 1, pointerEvents: 'none', width: '100%' }}>
+              {layer.text_content || ''}
+            </span>
+            {isSelected && selectedIds.size === 1 && resizeHandles.map(handle => (
+              <div key={handle.direction}
+                role="presentation"
+                title={`拖拽调整文本框 ${handle.direction.toUpperCase()} 边缘`}
+                onMouseDown={e => startTextBoxResize(layer, handle.direction, e)}
+                style={{
+                  position: 'absolute',
+                  width: handleSize,
+                  height: handleSize,
+                  borderRadius: 2 / Math.max(previewScale, 0.1),
+                  background: '#FFFFFF',
+                  border: `${1.5 / Math.max(previewScale, 0.1)}px solid var(--accent)`,
+                  boxSizing: 'border-box',
+                  zIndex: 20,
+                  cursor: handle.cursor,
+                  ...handle.style,
+                }} />
+            ))}
+          </div>
+        </Fragment>
       )
     }
     // image layer — 模板框只负责几何和裁剪，调整参数只作用于图片内容。
     const adjustmentTransform = layer.adjustments ? `rotate(${layer.adjustments.rotation}deg) scale(${layer.adjustments.scale})` : undefined
+    const imageTransform = getFlipTransform(layer, adjustmentTransform)
+    // 管理端上传的 SVG 形状遮罩：图片只显示在 SVG 画出的形状里（用户端与导出用同一份）。
+    const imageMaskSvg = (layer.mask_svg || '').trim()
+    const imageMaskStyle = svgMaskStyle(imageMaskSvg)
     const layerStyle = resolveLayerPreviewStyle(layer, {
       width: layer.css_width,
       height: layer.css_height,
@@ -1114,27 +1380,34 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
       opacity: fxOpacity,
     })
     const { boxShadow, objectFit, objectPosition, ...imageLayerStyle } = layerStyle
+    const imageBorderRadius = String(imageLayerStyle.borderRadius || '0')
+    const imageClipPath = imageBorderRadius !== '0' ? `inset(0 round ${imageBorderRadius})` : undefined
     return (
-      <div key={layer.id} data-layer-id={layer.id}
-        style={{ ...imageLayerStyle, cursor: 'grab', ...selBorder }}
-        onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }}>
-      {/* 背景模糊 overlay */}
+      <Fragment key={layer.id}>
+      {/* 背景模糊 overlay：与图层 wrapper 同级，圆角用图层自己的 border-radius / clip-path 裁剪 */}
       {backdropBlur > 0 && (
-        <div style={{ position: 'absolute', inset: 0, backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)`, background: 'rgba(255,255,255,0.08)', pointerEvents: 'none', zIndex: 1, borderRadius: 'inherit' }} />
+        <BackdropBlurOverlay box={imageLayerStyle} blurPx={backdropBlur} supported maskUrl={svgMaskImageUrl(imageMaskSvg)} />
       )}
+      <div data-layer-id={layer.id}
+        style={{ ...imageLayerStyle, cursor: 'grab', isolation: 'isolate', ...selBorder }}
+        onMouseDown={(e) => { handleCanvasSelect(layer.id, e); startCanvasDrag(layer.id, e) }}>
+      {/* 显式 clip-path 裁剪变换后的图片，避免浏览器只按矩形裁剪导致方角溢出圆角 */}
+      <div style={{ position: 'absolute', inset: 0, overflow: 'hidden', borderRadius: imageBorderRadius, clipPath: imageClipPath, WebkitClipPath: imageClipPath, contain: 'paint', zIndex: 2, ...((layer.admin_preview_url || layer.image_url) ? imageMaskStyle : {}) }}>
       {(layer.admin_preview_url || layer.image_url) ? (
         <img src={layer.admin_preview_url || layer.image_url} alt="" draggable={false}
-          style={{ position: 'relative', zIndex: 2, width: '100%', height: '100%', objectFit: objectFit || 'fill', objectPosition, pointerEvents: 'none', transform: adjustmentTransform, filter: mergeFilter }} />
+          style={{ width: '100%', height: '100%', objectFit: objectFit || 'fill', objectPosition, pointerEvents: 'none', transform: imageTransform, filter: mergeFilter }} />
       ) : (
         <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', pointerEvents: 'none' }}>
           <Image className="w-10 h-10 opacity-30" />
         </div>
       )}
+      </div>
       {/* box-shadow overlay — 置于图片之上确保 inset/normal shadow 都可见 */}
       {boxShadow && (
-        <div style={{ position: 'absolute', inset: 0, boxShadow, pointerEvents: 'none', borderRadius: imageLayerStyle.borderRadius != null ? imageLayerStyle.borderRadius : 'inherit', zIndex: 3 }} />
+        <div style={{ position: 'absolute', inset: 0, boxShadow, pointerEvents: 'none', borderRadius: imageBorderRadius, zIndex: 3 }} />
       )}
-    </div>
+      </div>
+      </Fragment>
     )
   }
 
@@ -1149,19 +1422,82 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
 
       {/* ═══ 顶部 ═══ */}
       <div className="rounded-2xl p-5 space-y-4" style={{ background: 'var(--bg-secondary)', boxShadow: 'var(--shadow-card)' }}>
-        <div className="flex items-center gap-4 flex-wrap">
-          <div className="flex-1 min-w-[200px]">
-            <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>模板名称 *</label>
-            <input value={tplName} onChange={e => setTplName(e.target.value)} placeholder="如：相册表盘 V1"
-              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
-              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>模板名称 *</label>
+              <input value={tplName} onChange={e => setTplName(e.target.value)} placeholder="如：相册表盘 V1"
+                className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+                style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>模糊度上限（px）</label>
+              <input type="number" min={1} max={200} value={blurMax}
+                onChange={e => setBlurMax(Math.min(200, Math.max(1, Math.round(Number(e.target.value) || 50))))}
+                className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+                style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+              <p className="text-[11px] mt-1.5" style={{ color: 'var(--text-muted)' }}>
+                用户端「效果-图片效果」里模糊度滑杆的最大峰值，默认 50。范围 1–200。
+              </p>
+            </div>
           </div>
+          <div>
+            <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>模板库 LOGO 封面 *（1:1 正方形，无圆角）</label>
+            <div className="flex items-center gap-3">
+              {coverImage ? (
+                <img
+                  src={coverImage.startsWith('http') ? coverImage : `${API_BASE}${coverImage}`}
+                  alt="模板库封面"
+                  width={72}
+                  height={72}
+                  className="flex-shrink-0 object-contain"
+                  style={{ width: 72, height: 72, borderRadius: 0, background: 'var(--bg-tertiary)' }}
+                />
+              ) : (
+                <div className="flex-shrink-0 flex items-center justify-center"
+                  style={{ width: 72, height: 72, borderRadius: 0, background: 'var(--bg-tertiary)', color: 'var(--text-muted)' }}>
+                  <Image className="w-5 h-5" />
+                </div>
+              )}
+              <div className="flex-1 min-w-0 space-y-2">
+                <label className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-medium cursor-pointer"
+                  style={{ background: 'var(--bg-tertiary)', color: 'var(--accent)', opacity: coverUploading ? 0.6 : 1 }}>
+                  <Upload className="w-4 h-4" />
+                  {coverUploading ? '上传中...' : (coverImage ? '更换 LOGO 封面' : '上传 LOGO 封面')}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    disabled={coverUploading}
+                    onChange={event => {
+                      const file = event.target.files?.[0]
+                      if (file) void handleCoverUpload(file)
+                      event.target.value = ''
+                    }}
+                  />
+                </label>
+                {coverImage && (
+                  <button type="button" onClick={() => setCoverImage('')}
+                    className="w-full px-4 py-2 rounded-xl text-xs font-medium"
+                    style={{ background: 'var(--bg-tertiary)', color: 'var(--danger)' }}>
+                    移除封面
+                  </button>
+                )}
+                <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  上传后自动裁成 512×512 正方形，模板库卡片按原样显示（不裁切、不加圆角）。
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="flex justify-end">
           <button onClick={handleSave} disabled={saving}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium text-white transition-all self-end"
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium text-white transition-all"
             style={{ background: 'var(--gradient-accent)', opacity: saving ? 0.6 : 1 }}>
             <Save className="w-4 h-4" /> {saving ? '保存中...' : '保存模板'}
           </button>
         </div>
+
         <div>
           <label className="block text-xs font-medium mb-2" style={{ color: 'var(--text-secondary)' }}>设备 *</label>
           <div className="flex items-center gap-2 flex-wrap mb-3">
@@ -1293,21 +1629,17 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
                     {ALIGN_ICONS['center']}
                   </button>
                   <span className="w-px h-5 mx-1" style={{ background: 'var(--border-color)' }} />
-                  <button onClick={() => {
-                    const gid = `g_${Date.now()}`
-                    setDeviceLayers(prev => prev.map(l => selectedIds.has(l.id) ? { ...l, group_id: gid } : l))
-                  }} disabled={selectedIds.size < 2}
-                    className="p-1.5 rounded-md transition-all"
-                    title="成组 (Ctrl+G)"
+                  <button onClick={linkSelectedLayers} disabled={selectedIds.size < 2}
+                    className="flex items-center gap-1 px-2 py-1.5 rounded-md text-[11px] font-medium transition-all"
+                    title="多图层同图 (Ctrl+G)：Ctrl+点击多选图层后，这些图层共用同一张用户上传图片"
                     style={{ color: selectedIds.size < 2 ? 'var(--text-muted)' : 'var(--accent)', background: 'transparent', opacity: selectedIds.size < 2 ? 0.35 : 1, cursor: selectedIds.size < 2 ? 'default' : 'pointer' }}>
                     <Group className="w-3.5 h-3.5" />
+                    多图层同图
                   </button>
                   {layers.some(l => selectedIds.has(l.id) && l.group_id) && (
-                    <button onClick={() => {
-                      setDeviceLayers(prev => prev.map(l => selectedIds.has(l.id) ? { ...l, group_id: undefined } : l))
-                    }}
+                    <button onClick={unlinkSelectedLayers}
                       className="p-1.5 rounded-md transition-all"
-                      title="解组 (Ctrl+Shift+G)"
+                      title="取消同图：这些图层恢复各自上传各自的图片 (Ctrl+Shift+G)"
                       style={{ color: 'var(--danger)', background: 'transparent' }}>
                       <X className="w-3.5 h-3.5" />
                     </button>
@@ -1327,16 +1659,16 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {layers.map((layer, idx) => (
-                    <LayerCard key={layer.id} layer={layer} idx={idx} dragIdx={dragIdx}
+                  {layers.map((layer, index) => (
+                    <LayerCard key={layer.id} layer={layer} idx={index} dragIdx={dragIdx}
                       expanded={expandedId === layer.id}
                       selected={selectedIds.has(layer.id)}
                       onToggle={() => setExpandedId(expandedId === layer.id ? null : layer.id)}
                       onSelect={(e) => handleLayerSelect(layer.id, e)}
                       onUpdate={p => updateLayer(layer.id, p)}
                       onDelete={() => removeLayer(layer.id)}
-                      onDragStart={() => { handleDragStart(idx); setExpandedId(null) }}
-                      onDragOver={e => handleDragOver(e, idx)}
+                      onDragStart={() => { handleDragStart(index); setExpandedId(null) }}
+                      onDragOver={e => handleDragOver(e, index)}
                       onDragEnd={handleDragEnd}
                       fontList={fontList} onFontUpload={handleFontUpload} fontLoading={fontLoading}
                       deviceW={device!.width} deviceH={device!.height} />
@@ -1351,33 +1683,49 @@ export function TemplateCreator({ onSaved, editTemplate }: { onSaved?: () => voi
   )
 }
 
+function LayerSection({ title, description, children, defaultOpen = false }: { title: string; description: string; children: React.ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <section className="rounded-xl overflow-hidden" style={{ border: '1px solid var(--border-color)', background: 'var(--bg-primary)' }}>
+      <button type="button" onClick={() => setOpen(value => !value)}
+        className="w-full flex items-center justify-between gap-3 px-3 py-2.5 text-left transition-colors"
+        style={{ background: 'var(--bg-tertiary)' }}>
+        <span className="min-w-0">
+          <span className="block text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>{title}</span>
+          <span className="block text-[10px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>{description}</span>
+        </span>
+        {open ? <ChevronDown className="w-4 h-4 flex-shrink-0" style={{ color: 'var(--text-muted)' }} /> : <ChevronRight className="w-4 h-4 flex-shrink-0" style={{ color: 'var(--text-muted)' }} />}
+      </button>
+      {open && <div className="p-3 space-y-3">{children}</div>}
+    </section>
+  )
+}
+
 /* ══════════════════════════════════════════════════════════
-   特效面板 — 透明度 + 模糊（所有图层类型共用）
+   透明度 + 模糊参数行（所有非文字图层共用）
+   —— 原独立的「特殊效果」栏已取消：这些参数现在平铺在各自图层的
+      参数区里，不折叠、不用滑杆，全部手填数字
    ══════════════════════════════════════════════════════════ */
 
-function EffectsPanel({ layer, onUpdate }: { layer: TemplateLayer; onUpdate: (p: Partial<TemplateLayer>) => void }) {
+function EffectRows({ layer, onUpdate }: { layer: TemplateLayer; onUpdate: (p: Partial<TemplateLayer>) => void }) {
   const fx = layer.effects || { ...DEFAULT_EFFECTS }
   const setFx = (patch: Partial<LayerEffects>) => onUpdate({ effects: { ...fx, ...patch } })
 
   return (
-    <div className="space-y-2.5">
-      <label className="block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>特殊效果</label>
-      {/* 透明度 */}
-      <div className="flex items-center gap-2">
-        <span className="text-xs w-16 flex-shrink-0" style={{ color: 'var(--text-muted)' }}>透明度</span>
-        <input type="range" min={0} max={100} step={1} value={fx.opacity}
-          onChange={e => setFx({ opacity: +e.target.value })}
-          className="flex-1" style={{ accentColor: 'var(--accent)' }}
-          onMouseDown={e => e.stopPropagation()} onPointerDown={e => e.stopPropagation()} />
-        <ScrubInput value={fx.opacity} min={0} max={100} step={1} unit="%"
-          onChange={v => setFx({ opacity: v })} />
+    <>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>透明度</span>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          <ScrubInput value={fx.opacity} min={0} max={100} step={1} unit="%"
+            onChange={v => setFx({ opacity: v })} />
+          <span className="text-xs w-6" style={{ color: 'var(--text-muted)' }}>%</span>
+        </div>
       </div>
-      {/* 模糊类型 */}
-      <div className="flex items-center gap-2">
-        <span className="text-xs w-16 flex-shrink-0" style={{ color: 'var(--text-muted)' }}>模糊类型</span>
-        <div className="flex items-center gap-1.5 flex-1">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>模糊类型</span>
+        <div className="flex items-center gap-1.5 flex-shrink-0">
           {(['none', 'gaussian', 'backdrop'] as const).map(bt => (
-            <button key={bt} onClick={() => setFx({ blur_type: bt })}
+            <button key={bt} type="button" onClick={() => setFx({ blur_type: bt })}
               className="px-2.5 py-1 rounded-lg text-xs font-medium transition-all"
               style={{
                 background: fx.blur_type === bt ? 'var(--accent-bg)' : 'var(--bg-tertiary)',
@@ -1389,19 +1737,17 @@ function EffectsPanel({ layer, onUpdate }: { layer: TemplateLayer; onUpdate: (p:
           ))}
         </div>
       </div>
-      {/* 模糊值 */}
       {fx.blur_type !== 'none' && (
-        <div className="flex items-center gap-2">
-          <span className="text-xs w-16 flex-shrink-0" style={{ color: 'var(--text-muted)' }}>模糊强度</span>
-          <input type="range" min={0} max={1000} step={1} value={fx.blur_value}
-            onChange={e => setFx({ blur_value: +e.target.value })}
-            className="flex-1" style={{ accentColor: 'var(--accent)' }}
-            onMouseDown={e => e.stopPropagation()} onPointerDown={e => e.stopPropagation()} />
-          <ScrubInput value={fx.blur_value} min={0} max={1000} step={1} unit="px"
-            onChange={v => setFx({ blur_value: v })} />
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>模糊强度</span>
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <ScrubInput value={fx.blur_value} min={0} step={1} unit="px"
+              onChange={v => setFx({ blur_value: v })} />
+            <span className="text-xs w-6" style={{ color: 'var(--text-muted)' }}>px</span>
+          </div>
         </div>
       )}
-    </div>
+    </>
   )
 }
 
@@ -1432,7 +1778,7 @@ function LayerCard({
   }, [editingName])
 
   const groupBadge = layer.group_id
-    ? <span className="ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium" style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}>组</span>
+    ? <span className="ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium" title="该图层与其他同图图层共用同一张用户上传图片" style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}>同图</span>
     : null
 
   return (
@@ -1491,26 +1837,77 @@ function LayerCard({
       }}>
         <div className="px-4 pb-4 space-y-3" style={{ borderTop: '1px solid var(--border-color)' }}>
           <div className="pt-3">
-            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>图层名称</label>
-            <input value={layer.name} onChange={e => onUpdate({ name: e.target.value })}
-              className="w-full px-3 py-2 rounded-lg text-sm outline-none" style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+            <div className="rounded-xl p-3 space-y-3" style={{ border: '1px solid var(--border-color)', background: 'var(--bg-primary)' }}>
+              <div>
+                <p className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>基础设置</p>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>名称和导出状态</p>
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>图层名称</label>
+                <input value={layer.name} onChange={e => onUpdate({ name: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg text-sm outline-none" style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+              </div>
+              <div className="flex items-center justify-between gap-3 pt-3" style={{ borderTop: '1px solid var(--border-color)' }}>
+                <div>
+                  <p className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>导出时显示</p>
+                  <p className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>关闭后只在后台保留该图层</p>
+                </div>
+                <button onClick={() => onUpdate({ visible_in_export: !(layer.visible_in_export ?? true) })}
+                  className="w-10 h-5 rounded-full transition-all relative flex-shrink-0" style={{ background: (layer.visible_in_export ?? true) ? 'var(--accent)' : 'var(--border-color)' }}>
+                  <div className="w-4 h-4 rounded-full bg-white absolute top-0.5 transition-all shadow-sm" style={{ left: (layer.visible_in_export ?? true) ? '22px' : '2px' }} />
+                </button>
+              </div>
+              {layer.type !== 'text' && (
+                <div className="flex items-center justify-between gap-3 pt-3" style={{ borderTop: '1px solid var(--border-color)' }}>
+                  <div>
+                    <p className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>镜像翻转</p>
+                    <p className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>预览、用户端和导出保持一致</p>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    {([
+                      { key: 'flip_horizontal', label: '水平', Icon: FlipHorizontal2 },
+                      { key: 'flip_vertical', label: '垂直', Icon: FlipVertical2 },
+                    ] as const).map(({ key, label, Icon }) => {
+                      const active = layer[key] === true
+                      return (
+                        <button key={key} onClick={() => onUpdate({ [key]: !active })}
+                          className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all"
+                          title={`${active ? '取消' : '启用'}${label}翻转`}
+                          aria-pressed={active}
+                          style={{ background: active ? 'var(--accent-bg)' : 'var(--bg-tertiary)', color: active ? 'var(--accent)' : 'var(--text-secondary)', border: `1px solid ${active ? 'var(--accent)' : 'var(--border-color)'}` }}>
+                          <Icon className="w-3.5 h-3.5" />{label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+              {/* 没有专属参数区的图层（历史数据里的 color 等）：透明度/模糊放在这里，保证旧模板仍可编辑 */}
+              {layer.type !== 'image' && layer.type !== 'svg' && layer.type !== 'shape' && layer.type !== 'text' && (
+                <>
+                  <div className="pt-3" style={{ borderTop: '1px solid var(--border-color)' }} />
+                  <div className="space-y-2.5">
+                    <EffectRows layer={layer} onUpdate={onUpdate} />
+                  </div>
+                </>
+              )}
+            </div>
           </div>
-          {/* 导出时是否显示 */}
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>导出时显示</label>
-            <button onClick={() => onUpdate({ visible_in_export: !(layer.visible_in_export ?? true) })}
-              className="w-10 h-5 rounded-full transition-all relative" style={{ background: (layer.visible_in_export ?? true) ? 'var(--accent)' : 'var(--border-color)' }}>
-              <div className="w-4 h-4 rounded-full bg-white absolute top-0.5 transition-all shadow-sm" style={{ left: (layer.visible_in_export ?? true) ? '22px' : '2px' }} />
-            </button>
-          </div>
-          {layer.type === 'image' && <ImageLayerConfig layer={layer} onUpdate={onUpdate} deviceW={deviceW} deviceH={deviceH} />}
-          {layer.type === 'svg' && <SvgShapeConfig layer={layer} onUpdate={onUpdate} deviceW={deviceW} deviceH={deviceH} />}
-          {layer.type === 'shape' && <SvgShapeConfig layer={layer} onUpdate={onUpdate} deviceW={deviceW} deviceH={deviceH} />}
-          {layer.type === 'text' && <TextLayerConfig layer={layer} onUpdate={onUpdate} fontList={fontList} onFontUpload={onFontUpload} fontLoading={fontLoading} deviceW={deviceW} deviceH={deviceH} />}
-          {/* 所有图层通用特效 */}
-          <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: 12 }}>
-            <EffectsPanel layer={layer} onUpdate={onUpdate} />
-          </div>
+          {layer.type === 'image' && (
+            <LayerSection title="图片内容与布局" description="上传资源、位置、尺寸和图片变换" defaultOpen>
+              <ImageLayerConfig layer={layer} onUpdate={onUpdate} deviceW={deviceW} deviceH={deviceH} />
+            </LayerSection>
+          )}
+          {(layer.type === 'svg' || layer.type === 'shape') && (
+            <LayerSection title={layer.type === 'svg' ? 'SVG 内容与布局' : '图形内容与布局'} description="内容、位置、尺寸和颜色设置" defaultOpen>
+              <SvgShapeConfig layer={layer} onUpdate={onUpdate} deviceW={deviceW} deviceH={deviceH} />
+            </LayerSection>
+          )}
+          {layer.type === 'text' && (
+            <LayerSection title="文字内容与布局" description="文字、字体、位置和文本框设置" defaultOpen>
+              <TextLayerConfig layer={layer} onUpdate={onUpdate} fontList={fontList} onFontUpload={onFontUpload} fontLoading={fontLoading} deviceW={deviceW} deviceH={deviceH} />
+            </LayerSection>
+          )}
         </div>
       </div>
     </div>
@@ -1523,6 +1920,21 @@ function LayerCard({
 
 function ImageLayerConfig({ layer, onUpdate, deviceW, deviceH }: { layer: TemplateLayer; onUpdate: (p: Partial<TemplateLayer>) => void; deviceW: number; deviceH: number }) {
   const [uploading, setUploading] = useState(false)
+  const maskFileRef = useRef<HTMLInputElement>(null)
+  const maskSvgCode = (layer.mask_svg || '').trim()
+  const maskSwatchUrl = maskSvgCode ? svgMaskImageUrl(maskSvgCode) : undefined
+  /* ── SVG 形状遮罩上传 ──
+     只取 SVG 根元素（extractSvgRoot 会剥掉 <?xml?> / <!DOCTYPE> 等前置声明），
+     服务端据此校验、渲染侧据此生成 mask-image 的 data URI。 */
+  const handleMaskUpload = (file: File) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const code = extractSvgRoot(reader.result as string)
+      if (!/^<svg[\s>]/i.test(code)) { window.alert('SVG 解析失败，请确认文件内容是以 <svg 开头的矢量图'); return }
+      onUpdate({ mask_svg: code })
+    }
+    reader.readAsText(file)
+  }
   const handleCssChange = (css: string) => {
     const pos = extractCssPosition(css, deviceW, deviceH)
     const patch: Partial<TemplateLayer> = { css_code: css }
@@ -1663,23 +2075,56 @@ function ImageLayerConfig({ layer, onUpdate, deviceW, deviceH }: { layer: Templa
         </button>
       </div>
       <div>
+        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+          SVG 形状遮罩 <span style={{ color: 'var(--text-muted)' }}>（可选：图片只显示在 SVG 画出的形状里）</span>
+        </label>
+        <input ref={maskFileRef} type="file" accept=".svg,image/svg+xml" className="hidden"
+          onChange={e => { const f = e.target.files?.[0]; if (f) handleMaskUpload(f); e.target.value = '' }} />
+        <div className="flex items-center gap-2">
+          {maskSwatchUrl ? (
+            <>
+              {/* 遮罩自己渲染一个色块：看到的就是图片实际会被裁出来的范围 */}
+              <div className="w-12 h-12 rounded-lg flex-shrink-0"
+                style={{ background: 'var(--accent)', maskImage: maskSwatchUrl, WebkitMaskImage: maskSwatchUrl, maskSize: '100% 100%', WebkitMaskSize: '100% 100%', maskRepeat: 'no-repeat', WebkitMaskRepeat: 'no-repeat' }} />
+              <div className="flex-1 min-w-0">
+                <p className="text-xs truncate" style={{ color: 'var(--text-primary)' }}>已应用 SVG 形状遮罩</p>
+                <button onClick={() => onUpdate({ mask_svg: '' })} className="text-[10px] mt-0.5" style={{ color: 'var(--danger)' }}>清除遮罩</button>
+              </div>
+              <button onClick={() => maskFileRef.current?.click()}
+                className="px-2 py-1 rounded text-[10px] font-medium flex-shrink-0"
+                style={{ background: 'var(--bg-tertiary)', color: 'var(--text-secondary)' }}>更换</button>
+            </>
+          ) : (
+            <button onClick={() => maskFileRef.current?.click()}
+              className="flex items-center gap-2 px-4 py-3 rounded-xl text-xs font-medium transition-colors w-full"
+              style={{ border: '2px dashed var(--border-color)', color: 'var(--text-secondary)' }}>
+              <Upload className="w-4 h-4" /> 点击选择 SVG 遮罩
+            </button>
+          )}
+        </div>
+        <p className="text-[10px] mt-1.5" style={{ color: 'var(--text-muted)' }}>
+          上传后用户上传的图片只会显示在 SVG 的形状范围内（形状外的部分被裁掉，SVG 自身颜色不参与绘制）。
+        </p>
+      </div>
+      <div>
         <label className="block text-xs font-medium mb-2" style={{ color: 'var(--text-secondary)' }}>图片参数调整</label>
         <div className="space-y-2.5">
           {ADJ_SPECS.map(s => {
             const v = layer.adjustments?.[s.key] ?? getAdjDefault(s.key)
             return (
-              <div key={s.key} className="flex items-center gap-2">
-                <span className="text-xs w-16 flex-shrink-0" style={{ color: 'var(--text-muted)' }}>{s.label}</span>
-                <input type="range" min={s.min} max={s.max} step={s.step} value={v}
-                  onChange={e => onUpdate({ adjustments: { ...(layer.adjustments || DEFAULT_ADJUSTMENTS), [s.key]: +e.target.value } })}
-                  className="flex-1" style={{ accentColor: 'var(--accent)' }}
-                  onMouseDown={e => e.stopPropagation()} onPointerDown={e => e.stopPropagation()} />
-                <ScrubInput value={v} min={s.min} max={s.max} step={s.step} unit={s.unit}
-                  onChange={v => onUpdate({ adjustments: { ...(layer.adjustments || DEFAULT_ADJUSTMENTS), [s.key]: v } })} />
-                <span className="text-xs w-6 text-left" style={{ color: 'var(--text-muted)' }}>{s.unit}</span>
+              <div key={s.key} className="flex items-center justify-between gap-3">
+                <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{s.label}</span>
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  <ScrubInput value={v} min={s.min} max={s.max} step={s.step} unit={s.unit}
+                    onChange={v => onUpdate({ adjustments: { ...(layer.adjustments || DEFAULT_ADJUSTMENTS), [s.key]: v } })} />
+                  <span className="text-xs w-6" style={{ color: 'var(--text-muted)' }}>{s.unit}</span>
+                </div>
               </div>
             )
           })}
+          {/* 透明度与模糊：原「特殊效果」栏的内容，平铺在同一区域，不做折叠 */}
+          <div className="pt-2.5" style={{ borderTop: '1px solid var(--border-color)' }} />
+          <EffectRows layer={layer} onUpdate={onUpdate} />
         </div>
       </div>
     </>
@@ -1694,6 +2139,19 @@ function SvgShapeConfig({ layer, onUpdate, deviceW, deviceH }: { layer: Template
   const isSvg = layer.type === 'svg'
   const fileRef = useRef<HTMLInputElement>(null)
   const [dragOver, setDragOver] = useState(false)
+  const colorMode = layer.color_mode ?? 'picker'
+  const pickerDefault = layer.picker_default ?? 'light'
+  const sourceColor = isSvg ? extractSvgColor(layer.css_code || '') : extractCssPaint(layer.css_code || '')
+  const fixedColor = layer.color || sourceColor || '#8884FF'
+  const isSolidColor = CSS.supports('color', fixedColor)
+
+  const setColorMode = (mode: 'fixed' | 'picker') => {
+    if (mode === 'fixed') {
+      onUpdate({ color_mode: mode, color: sourceColor || layer.color || undefined })
+      return
+    }
+    onUpdate({ color_mode: mode, picker_default: pickerDefault })
+  }
 
   /* ── SVG 文件上传 ── */
   const handleSvgUpload = (file: File) => {
@@ -1770,7 +2228,7 @@ function SvgShapeConfig({ layer, onUpdate, deviceW, deviceH }: { layer: Template
           <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>CSS 图形代码</label>
           <textarea value={layer.css_code} onChange={e => {
             const css = e.target.value
-            const color = extractCssColor(css)
+            const color = extractCssPaint(css)
             const pos = extractCssPosition(css, deviceW, deviceH)
             const patch: Partial<TemplateLayer> = { css_code: css, color }
             if (pos.x !== undefined) patch.x = pos.x
@@ -1819,37 +2277,59 @@ function SvgShapeConfig({ layer, onUpdate, deviceW, deviceH }: { layer: Template
         <label className="block text-xs font-medium mb-2" style={{ color: 'var(--text-secondary)' }}>颜色模式</label>
         <div className="flex items-center gap-2 mb-3">
           {(['fixed', 'picker'] as const).map(m => (
-            <button key={m} onClick={() => onUpdate({ color_mode: m })} className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-              style={{ background: layer.color_mode === m ? 'var(--accent-bg)' : 'var(--bg-tertiary)', color: layer.color_mode === m ? 'var(--accent)' : 'var(--text-secondary)', border: `1.5px solid ${layer.color_mode === m ? 'var(--accent)' : 'transparent'}` }}>
+            <button key={m} onClick={() => setColorMode(m)} className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
+              style={{ background: colorMode === m ? 'var(--accent-bg)' : 'var(--bg-tertiary)', color: colorMode === m ? 'var(--accent)' : 'var(--text-secondary)', border: `1.5px solid ${colorMode === m ? 'var(--accent)' : 'transparent'}` }}>
               {m === 'fixed' ? '固定颜色' : '跟随取色'}
             </button>
           ))}
         </div>
-        {layer.color_mode === 'fixed' && (
+        {colorMode === 'fixed' && (
           <div>
             <div className="flex items-center gap-2">
               <span className="text-xs" style={{ color: 'var(--text-muted)' }}>颜色</span>
-              <input type="color" value={layer.color || '#8884FF'} onChange={e => onUpdate({ color: e.target.value })} className="w-8 h-8 rounded-lg cursor-pointer border-0" />
-              <input value={layer.color || ''} onChange={e => onUpdate({ color: e.target.value || undefined })}
-                placeholder="留空使用原始SVG颜色"
+              <div className="w-9 h-9 rounded-lg overflow-hidden relative flex-shrink-0"
+                title={fixedColor}
+                style={{
+                  border: '1px solid var(--border-color)',
+                  backgroundColor: '#fff',
+                  backgroundImage: 'linear-gradient(45deg, #d8d8d8 25%, transparent 25%), linear-gradient(-45deg, #d8d8d8 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #d8d8d8 75%), linear-gradient(-45deg, transparent 75%, #d8d8d8 75%)',
+                  backgroundSize: '8px 8px',
+                  backgroundPosition: '0 0, 0 4px, 4px -4px, -4px 0px',
+                }}>
+                <span className="absolute inset-0" style={{ background: fixedColor }} />
+                {isSolidColor && (
+                  <input type="color" value={toColorInputValue(fixedColor)} onChange={e => onUpdate({ color: e.target.value })}
+                    className="absolute inset-0 w-full h-full cursor-pointer opacity-0" aria-label="选择固定颜色" />
+                )}
+              </div>
+              <input value={layer.color || sourceColor || ''} onChange={e => onUpdate({ color: e.target.value || undefined })}
+                placeholder="未读取到源代码颜色或渐变"
                 className="px-3 py-1.5 rounded-lg text-xs outline-none flex-1" style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
             </div>
-            <p className="text-[10px] mt-1" style={{ color: 'var(--text-muted)' }}>留空则使用 SVG 文件的原始颜色</p>
+            <p className="text-[10px] mt-1" style={{ color: 'var(--text-muted)' }}>切换到固定颜色时自动读取当前 {isSvg ? 'SVG 颜色' : 'CSS 的 RGBA 或完整渐变'}</p>
           </div>
         )}
-        {layer.color_mode === 'picker' && (
+        {colorMode === 'picker' && (
           <div>
             <label className="block text-xs mb-2" style={{ color: 'var(--text-muted)' }}>默认取色偏好</label>
             <div className="flex items-center gap-2">
               {(['dark', 'light'] as const).map(p => (
                 <button key={p} onClick={() => onUpdate({ picker_default: p })} className="px-4 py-2 rounded-lg text-xs font-medium transition-all"
-                  style={{ background: layer.picker_default === p ? 'var(--accent-bg)' : 'var(--bg-tertiary)', color: layer.picker_default === p ? 'var(--accent)' : 'var(--text-secondary)', border: `1.5px solid ${layer.picker_default === p ? 'var(--accent)' : 'transparent'}` }}>
+                  style={{ background: pickerDefault === p ? 'var(--accent-bg)' : 'var(--bg-tertiary)', color: pickerDefault === p ? 'var(--accent)' : 'var(--text-secondary)', border: `1.5px solid ${pickerDefault === p ? 'var(--accent)' : 'transparent'}` }}>
                   {p === 'dark' ? '深色' : '浅色'}
                 </button>
               ))}
             </div>
           </div>
         )}
+      </div>
+
+      {/* 透明度与模糊：原「特殊效果」栏的内容，作为参数区的同级块平铺，不做折叠。
+          间距与图片图层的「图片参数调整」一致：分割线上下各留一格，避免和上面的
+          颜色设置、下面的每一行贴在一起。 */}
+      <div className="pt-2.5" style={{ borderTop: '1px solid var(--border-color)' }} />
+      <div className="space-y-2.5">
+        <EffectRows layer={layer} onUpdate={onUpdate} />
       </div>
     </>
   )
@@ -1871,6 +2351,11 @@ function TextLayerConfig({
   const fileRef = useRef<HTMLInputElement>(null)
   const selectedFont = fontList.find(f => f.family_name === layer.font_family)
   const isVarFont = selectedFont?.is_variable ?? false
+  const textRect = getLayerVisualRect(layer, deviceW, deviceH)
+  const setTextPosition = (x: number, y: number) => onUpdate(writeDraggedPosition(layer, x, y))
+  const setTextSize = (width: number, height: number) => onUpdate(
+    writeTextBoxSize(layer, textRect.x, textRect.y, width, height),
+  )
 
   const handleFileUpload = async (file: File) => {
     try {
@@ -1898,7 +2383,7 @@ function TextLayerConfig({
           rows={2}
           className="w-full rounded-lg p-2 text-xs font-mono"
           style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', resize: 'vertical' }}
-          placeholder={'font-size: 16px;\ncolor: #FFFFFF;\ntext-align: center;\nfont-family: "PingFang SC";'}
+          placeholder={'font-size: 16px;\ncolor: #FFFFFF;\n-webkit-text-stroke: 1px #000000;\ntext-align: center;\nfont-family: "PingFang SC";'}
           onChange={(e) => {
             const css = e.target.value
             const cssLower = parseCssDeclarations(css)
@@ -2069,28 +2554,131 @@ function TextLayerConfig({
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
-        <div className="flex-1">
+      <div className="grid grid-cols-2 gap-3">
+        <div>
           <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>X 坐标</label>
-          <ScrubInput value={layer.x} min={-9999} max={9999} step={1} unit="px"
-            onChange={v => onUpdate({ x: v })} />
+          <ScrubInput value={Math.round(textRect.x)} min={-9999} max={9999} step={1} unit="px"
+            onChange={v => setTextPosition(v, textRect.y)} />
         </div>
-        <div className="flex-1">
+        <div>
           <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Y 坐标</label>
-          <ScrubInput value={layer.y} min={-9999} max={9999} step={1} unit="px"
-            onChange={v => onUpdate({ y: v })} />
+          <ScrubInput value={Math.round(textRect.y)} min={-9999} max={9999} step={1} unit="px"
+            onChange={v => setTextPosition(textRect.x, v)} />
+        </div>
+        <div>
+          <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>文本框宽度</label>
+          <ScrubInput value={Math.round(textRect.w)} min={16} max={9999} step={1} unit="px"
+            onChange={v => setTextSize(v, textRect.h)} />
+        </div>
+        <div>
+          <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>文本框高度</label>
+          <ScrubInput value={Math.round(textRect.h)} min={8} max={9999} step={1} unit="px"
+            onChange={v => setTextSize(textRect.w, v)} />
         </div>
       </div>
 
       <div>
-        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>文字颜色</label>
-        <div className="flex items-center gap-2">
-          <input type="color" value={layer.text_color || '#FFFFFF'} onChange={e => onUpdate({ text_color: e.target.value })}
-            className="w-8 h-8 rounded-lg cursor-pointer border-0" />
-          <input value={layer.text_color || '#FFFFFF'} onChange={e => onUpdate({ text_color: e.target.value })}
-            className="px-3 py-1.5 rounded-lg text-xs outline-none flex-1"
-            style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+        <div className="flex items-center justify-between gap-3 mb-1">
+          <label className="block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>文字颜色</label>
+          <button type="button" onClick={() => onUpdate({
+            color_mode: layer.color_mode === 'picker' ? 'fixed' : 'picker',
+            picker_default: layer.picker_default || 'light',
+          })}
+            className="text-[11px] font-medium px-2 py-1 rounded-md"
+            style={{ background: layer.color_mode === 'picker' ? 'var(--accent-bg)' : 'var(--bg-tertiary)', color: layer.color_mode === 'picker' ? 'var(--accent)' : 'var(--text-secondary)' }}>
+            {layer.color_mode === 'picker' ? '自动取色' : '固定颜色'}
+          </button>
         </div>
+        {layer.color_mode === 'picker' ? (
+          <div className="flex items-center justify-between gap-2 rounded-lg px-3 py-2" style={{ background: 'var(--bg-tertiary)' }}>
+            <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>自动选择</span>
+            <div className="flex gap-1.5">
+              {(['light', 'dark'] as const).map(preference => (
+                <button key={preference} type="button" onClick={() => onUpdate({ picker_default: preference })}
+                  className="px-2 py-1 rounded text-[11px]"
+                  style={{ background: (layer.picker_default || 'light') === preference ? 'var(--accent)' : 'var(--bg-primary)', color: (layer.picker_default || 'light') === preference ? '#fff' : 'var(--text-secondary)' }}>
+                  {preference === 'light' ? '浅色' : '深色'}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <input type="color" value={layer.text_color || '#FFFFFF'} onChange={e => onUpdate({ text_color: e.target.value })}
+              className="w-8 h-8 rounded-lg cursor-pointer border-0" />
+            <input value={layer.text_color || '#FFFFFF'} onChange={e => onUpdate({ text_color: e.target.value })}
+              className="px-3 py-1.5 rounded-lg text-xs outline-none flex-1"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+          </div>
+        )}
+      </div>
+
+      {/* 文字描边（手动配置，颜色与文字颜色相互独立） */}
+      <div>
+        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>文字描边</label>
+        <ScrubInput value={layer.text_stroke_size ?? 0} min={0} max={50} step={0.5} unit="px"
+          onChange={v => onUpdate({ text_stroke_size: v })} />
+        {(layer.text_stroke_size ?? 0) > 0 && (
+          <>
+            <div className="mt-3">
+              <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>描边位置</label>
+              <div className="flex gap-1.5">
+                {([
+                  { v: 'outset', label: '外描边' },
+                  { v: 'center', label: '居中描边' },
+                  { v: 'inset', label: '内描边' },
+                ] as const).map(opt => {
+                  const active = (layer.text_stroke_type || 'center') === opt.v
+                  return (
+                    <button key={opt.v} type="button" onClick={() => onUpdate({ text_stroke_type: opt.v })}
+                      className="flex-1 py-1.5 px-2 rounded-lg text-xs font-medium transition-all duration-150"
+                      style={{
+                        background: active ? 'var(--accent)' : 'var(--bg-tertiary)',
+                        color: active ? '#fff' : 'var(--text-secondary)',
+                        border: `1px solid ${active ? 'var(--accent)' : 'var(--border-color)'}`,
+                      }}
+                    >{opt.label}</button>
+                  )
+                })}
+              </div>
+            </div>
+            <div className="mt-3">
+              <div className="flex items-center justify-between gap-3 mb-1">
+                <label className="block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>描边颜色</label>
+                <button type="button" onClick={() => onUpdate({
+                  text_stroke_color_mode: layer.text_stroke_color_mode === 'picker' ? 'fixed' : 'picker',
+                })}
+                  className="text-[11px] font-medium px-2 py-1 rounded-md"
+                  style={{ background: layer.text_stroke_color_mode === 'picker' ? 'var(--accent-bg)' : 'var(--bg-tertiary)', color: layer.text_stroke_color_mode === 'picker' ? 'var(--accent)' : 'var(--text-secondary)' }}
+                >
+                  {layer.text_stroke_color_mode === 'picker' ? '自动取色' : '固定颜色'}
+                </button>
+              </div>
+              {layer.text_stroke_color_mode === 'picker' ? (
+                <div className="flex items-center justify-between gap-2 rounded-lg px-3 py-2" style={{ background: 'var(--bg-tertiary)' }}>
+                  <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>自动选择</span>
+                  <div className="flex gap-1.5">
+                    {(['light', 'dark'] as const).map(preference => (
+                      <button key={preference} type="button" onClick={() => onUpdate({ text_stroke_picker_default: preference })}
+                        className="px-2 py-1 rounded text-[11px]"
+                        style={{ background: (layer.text_stroke_picker_default || 'light') === preference ? 'var(--accent)' : 'var(--bg-primary)', color: (layer.text_stroke_picker_default || 'light') === preference ? '#fff' : 'var(--text-secondary)' }}>
+                        {preference === 'light' ? '浅色' : '深色'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <input type="color" value={layer.text_stroke_color || '#000000'} onChange={e => onUpdate({ text_stroke_color: e.target.value })}
+                    className="w-8 h-8 rounded-lg cursor-pointer border-0" />
+                  <input value={layer.text_stroke_color || '#000000'} onChange={e => onUpdate({ text_stroke_color: e.target.value })}
+                    className="px-3 py-1.5 rounded-lg text-xs outline-none flex-1"
+                    style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+                </div>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </>
   )

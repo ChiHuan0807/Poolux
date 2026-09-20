@@ -17,7 +17,7 @@ interface GalleryImage {
 const DEVICES = ['小米手环 10', '小米手环 Pro', 'REDMI Watch 6']
 
 // 相册表盘模板（自动获取自表盘编辑页）
-const TEMPLATES = ['「Canopy UI」', '「时语」', '「Layer UI」']
+const TEMPLATES = ['「时语」', '「Layer UI」']
 
 /* ═══ 公开浏览页面 ═══ */
 export function Gallery() {

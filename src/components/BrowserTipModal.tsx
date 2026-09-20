@@ -26,6 +26,8 @@ export function BrowserTipModal() {
       setIsOpen(false)
       document.body.style.overflow = ''
       localStorage.setItem(STORAGE_KEY, '1')
+      // 入站提醒在等这个弹窗让位，关掉后通知它一声
+      window.dispatchEvent(new Event('poolux:browser-tip-closed'))
     }, 200)
   }
 

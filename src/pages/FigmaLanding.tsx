@@ -170,27 +170,68 @@ type WorkImage = {
   image_url: string
 }
 
-const repeatToLength = (images: string[], minimum: number) =>
-  Array.from({ length: Math.max(minimum, images.length) }, (_, index) => images[index % images.length])
+const WORKS_WALL_SEED = Math.floor(Math.random() * 0x7fffffff)
 
-/** Fisher-Yates shuffle，每次进入页面随机打乱图片顺序 */
-function shuffle<T>(arr: T[]): T[] {
-  const a = [...arr]
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[a[i], a[j]] = [a[j], a[i]]
+function hashText(value: string): number {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
   }
-  return a
+  return hash >>> 0
+}
+
+function createSeededRandom(seed: number) {
+  let state = seed >>> 0
+  return () => {
+    state += 0x6D2B79F5
+    let value = state
+    value = Math.imul(value ^ (value >>> 15), value | 1)
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61)
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+function shuffleWithSeed<T>(items: T[], seed: number): T[] {
+  const result = [...items]
+  const random = createSeededRandom(seed)
+  for (let index = result.length - 1; index > 0; index--) {
+    const target = Math.floor(random() * (index + 1))
+    ;[result[index], result[target]] = [result[target], result[index]]
+  }
+  return result
+}
+
+function repeatToLength(images: string[], minimum: number): string[] {
+  if (images.length === 0) return []
+  return Array.from(
+    { length: Math.max(minimum, images.length) },
+    (_, index) => images[index % images.length],
+  )
+}
+
+/**
+ * 先把去重后的图片随机分配到不同列，再分别补齐长度。
+ * 同一张作品只归属一列，避免三列只是顺序不同但内容重复。
+ */
+function buildWorksRows(images: string[], rowCount = 3, minimum = 18): string[][] {
+  const uniqueImages = [...new Set(images)].sort()
+  const signature = uniqueImages.join('|')
+  const baseSeed = WORKS_WALL_SEED ^ hashText(signature)
+  const shuffled = shuffleWithSeed(uniqueImages, baseSeed)
+  const buckets = Array.from({ length: rowCount }, () => [] as string[])
+
+  shuffled.forEach((image, index) => buckets[index % rowCount].push(image))
+
+  return buckets.map((bucket, index) =>
+    repeatToLength(shuffleWithSeed(bucket, baseSeed + index + 1), minimum),
+  )
 }
 
 function WorksWall({ images }: { images: string[] }) {
   const wallRef = useRef<HTMLDivElement>(null)
   const rowRefs = useRef<Array<HTMLDivElement | null>>([])
-  const rows = useMemo(() => {
-    const shuffled = shuffle(images)
-    const repeated = repeatToLength(shuffled, 18)
-    return [repeated, [...repeated].reverse(), repeated]
-  }, [images])
+  const rows = useMemo(() => buildWorksRows(images), [images])
 
   useEffect(() => {
     let progress = 0
@@ -262,8 +303,13 @@ export function FigmaLanding() {
     const loadWorks = async () => {
       try {
         const works = await apiFetch('/api/works') as WorkImage[]
-        if (!disposed && works.length > 0) {
-          setWorkImages(works.map((work) => work.image_url))
+        const urls = [...new Set(works.map(work => work.image_url).filter(Boolean))].sort()
+        if (!disposed && urls.length >= 3) {
+          setWorkImages(current =>
+            current.length === urls.length && current.every((url, index) => url === urls[index])
+              ? current
+              : urls,
+          )
         }
       } catch { /* ignore */ }
     }

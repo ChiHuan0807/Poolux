@@ -1,251 +1,191 @@
-import { useCallback, useState, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { ChevronRight, LayoutGrid, RefreshCw, TriangleAlert } from 'lucide-react'
 import { Navbar } from '@/components/Navbar'
 import { apiFetch, API_BASE } from '@/lib/api'
 
-/* ── 类型 ── */
-interface Layer {
-  name: string
-  css_code: string
-  type: 'color' | 'image' | 'svg' | 'shape' | 'text'
-  color_mode?: 'fixed' | 'picker'
-  color?: string
-  image_url?: string
-  show_on_client?: boolean
-  css_position_code?: string
-  z_index?: number
-}
-
-interface DeviceConfig {
-  name: string
-  width: number
-  height: number
-  corner_radius: number
-  layers: Layer[]
-}
-
-interface Template {
+// 公开接口只返回卡片需要的字段：模板名 + 1:1 封面图。
+// 简介（description）已下线，封面也不再由服务端自动合成。
+interface TemplateCard {
   id: number
   name: string
-  devices: DeviceConfig[]
   preview_image: string
-  created_at: string
-  updated_at: string
 }
 
-/* ── CSS 解析（复用 Components.tsx 逻辑） ── */
-function toReactKey(key: string): string {
-  return key.replace(/-([a-z])/g, (_, c) => c.toUpperCase())
+type LoadState = 'loading' | 'ready' | 'error'
+
+/** 骨架数量取桌面端两行的量（一行 4 个），加载完成前后网格高度不跳动 */
+const SKELETON_COUNT = 8
+
+// 一行几列由 .tpl-grid 的 CSS 变量控制：手机 2 列、平板 3 列、桌面 4 列，最后一行不满时居中
+const GRID_CLASS = 'tpl-grid'
+
+function assetUrl(path: string): string {
+  if (!path) return ''
+  return /^https?:\/\//i.test(path) ? path : `${API_BASE}${path}`
 }
 
-function parseCssBlock(raw: string): Record<string, string> {
-  let css = raw.trim()
-  const m = css.match(/\{([\s\S]*)\}/)
-  if (m) css = m[1]
-  css = css.replace(/\/\*[\s\S]*?\*\//g, '')
-  const result: Record<string, string> = {}
-  for (const seg of css.split(';')) {
-    const s = seg.trim()
-    const i = s.indexOf(':')
-    if (i < 0) continue
-    const key = s.slice(0, i).trim().toLowerCase()
-    const val = s.slice(i + 1).trim()
-    if (key && val) result[key] = val
-  }
-  return result
-}
-
-function cssToProps(css: Record<string, string>): React.CSSProperties {
-  const style: Record<string, any> = {}
-  for (const [key, val] of Object.entries(css)) {
-    if (key === 'display' || key === 'position' || key === 'float' || key === 'clear') continue
-    style[toReactKey(key)] = val
-  }
-  style.position = 'absolute'
-  return style as React.CSSProperties
-}
-
-function migrateLayer(l: any, i: number): Layer {
-  const migrated = { ...l, show_on_client: l.show_on_client ?? true }
-  if (l.css_shape && !l.css_code) {
-    return { ...migrated, css_code: `clip-path: ${l.css_shape}`, type: l.type || 'color', z_index: l.z_index ?? i, css_shape: undefined }
-  }
-  return { ...migrated, css_code: l.css_code || '', type: l.type || 'color', z_index: l.z_index ?? i }
-}
-
-function migrateTemplate(t: any): Template {
-  if (!t.devices || !Array.isArray(t.devices) || t.devices.length === 0) {
-    return { ...t, devices: [], preview_image: t.preview_image || '' }
-  }
-  if (typeof t.devices[0] === 'string') {
-    const oldLayers: Layer[] = Array.isArray(t.layers) ? t.layers : []
-    return {
-      ...t,
-      preview_image: t.preview_image || '',
-      devices: (t.devices as string[]).map((name: string) => ({
-        name,
-        width: 212, height: 520, corner_radius: 48,
-        layers: oldLayers.map((l, i) => migrateLayer(l, i)),
-      })),
-    }
-  }
-  return {
-    ...t,
-    preview_image: t.preview_image || '',
-    devices: t.devices.map((d: any) => ({
-      ...d,
-      width: d.width || 212,
-      height: d.height || 520,
-      corner_radius: d.corner_radius || 48,
-      layers: Array.isArray(d.layers) ? d.layers.map((l: any, i: number) => migrateLayer(l, i)) : [],
-    })),
-  }
-}
-
-/* ── 缩略图渲染 ── */
-function RenderLayer({ layer }: { layer: Layer }) {
-  if (layer.type === 'image' && layer.show_on_client === false) return null
-  if (layer.type === 'image' && layer.image_url) {
-    const css = {
-      ...parseCssBlock(layer.css_code || ''),
-      ...parseCssBlock(layer.css_position_code || ''),
-    }
-    const w = css['width'] || '100%'
-    const h = css['height'] || '100%'
-    const containerStyle: React.CSSProperties = {
-      position: 'absolute',
-      left: css['left'] || '0',
-      top: css['top'] || '0',
-      width: w,
-      height: h,
-      opacity: css['opacity'] || '1',
-      transform: css['transform'] || undefined,
-      filter: css['filter'] || undefined,
-      overflow: 'hidden',
-    }
-    return <img src={layer.image_url} alt="" draggable={false} style={{ ...containerStyle, objectFit: 'cover', pointerEvents: 'none' }} />
-  }
-  const css = parseCssBlock(layer.css_code || '')
-  const style = cssToProps(css)
-  return <div style={style} />
-}
-
-function TemplateThumbnail({ template, size = 80 }: { template: Template; size?: number }) {
-  const d = template.devices[0]
-  if (!d) return <div className="rounded-xl" style={{ width: size, height: size * 1.4, background: '#1a1a2e' }} />
-  const scale = Math.min(size / d.width, (size * 1.4) / d.height)
-  const displayW = Math.round(d.width * scale)
-  const displayH = Math.round(d.height * scale)
-  const sorted = [...d.layers].sort((a, b) => (a.z_index ?? 0) - (b.z_index ?? 0))
-
+function CardSkeleton() {
   return (
-    <div style={{
-      width: displayW,
-      height: displayH,
-      borderRadius: Math.round(d.corner_radius * scale),
-      overflow: 'hidden',
-      background: '#111',
-      position: 'relative',
-      border: '1px solid rgba(255,255,255,0.1)',
-      flexShrink: 0,
-    }}>
-      <div style={{
-        width: d.width,
-        height: d.height,
-        transform: `scale(${scale})`,
-        transformOrigin: 'top left',
-        position: 'relative',
-        overflow: 'hidden',
-      }}>
-        {sorted.map((layer, i) => <RenderLayer key={i} layer={layer} />)}
+    <div className="tpl-skeleton" aria-hidden="true">
+      <div className="tpl-skeleton__cover" />
+      <div className="tpl-skeleton__bar">
+        <div className="tpl-skeleton__line" />
       </div>
     </div>
   )
 }
 
-/* ── 主页面 ── */
-const BUILTIN_CARDS = [
-  { label: '「Canopy UI」', sub: '相册表盘', path: '/tools/watch-face/edit' },
-  { label: '「时语」', sub: '相册表盘', path: '/tools/watch-face/edit-shiyu' },
-]
+/** 空态与错误态：版式与后台其他空态保持一致（圆角面板 + 图标 + 说明 + 可选操作） */
+function StatePanel({ tone, title, hint, action }: {
+  tone: 'muted' | 'danger'
+  title: string
+  hint: string
+  action?: { label: string; onClick: () => void }
+}) {
+  const danger = tone === 'danger'
+  const Icon = danger ? TriangleAlert : LayoutGrid
+  return (
+    <div className="text-center py-14 rounded-2xl" style={{ background: 'var(--bg-secondary)' }}>
+      <span
+        className="inline-flex items-center justify-center w-11 h-11 rounded-full mb-3"
+        style={{
+          background: danger ? 'rgba(255, 59, 48, 0.1)' : 'var(--bg-tertiary)',
+          color: danger ? 'var(--danger)' : 'var(--text-muted)',
+        }}
+      >
+        <Icon className="w-5 h-5" />
+      </span>
+      <p className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{title}</p>
+      <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>{hint}</p>
+      {action && (
+        <button
+          type="button"
+          onClick={action.onClick}
+          className="inline-flex items-center gap-1.5 mt-4 px-4 py-2 rounded-xl text-xs font-medium transition-all"
+          style={{ background: 'var(--accent-bg)', color: 'var(--accent)', cursor: 'pointer' }}
+        >
+          <RefreshCw className="w-3.5 h-3.5" />
+          {action.label}
+        </button>
+      )}
+    </div>
+  )
+}
 
 export function WatchFaceHome() {
   const navigate = useNavigate()
-  const [templates, setTemplates] = useState<Template[]>([])
+  const [templates, setTemplates] = useState<TemplateCard[]>([])
+  const [state, setState] = useState<LoadState>('loading')
+  const [reloadKey, setReloadKey] = useState(0)
+  // 封面图已解码的模板 id 集合（骨架微光照上面再停掉）
+  const [loadedCovers, setLoadedCovers] = useState<Record<number, boolean>>({})
 
+  // 重试：bump reloadKey 让下面的 effect 重新拉一次
   useEffect(() => {
-    const ac = new AbortController()
-    apiFetch('/api/templates', { signal: ac.signal })
-      .then((data: any[]) => setTemplates(data.map(migrateTemplate)))
-      .catch(() => {})
-    return () => ac.abort()
+    const controller = new AbortController()
+    setState('loading')
+    apiFetch('/api/templates', { signal: controller.signal })
+      .then((data: TemplateCard[]) => {
+        setTemplates(Array.isArray(data) ? data : [])
+        setState('ready')
+      })
+      .catch((err: unknown) => {
+        // 卸载或重试导致的主动取消不算失败
+        if ((err as { name?: string })?.name === 'AbortError') return
+        setState('error')
+      })
+    return () => controller.abort()
+  }, [reloadKey])
+
+  const openTemplate = useCallback(
+    (id: number) => navigate(`/tools/watch-face/edit-template/${id}`),
+    [navigate],
+  )
+
+  // 封面图解码完成的模板：没解码完之前封面铺一层微光骨架，解码完成后停掉动画
+  const markCoverLoaded = useCallback((id: number) => {
+    setLoadedCovers(prev => (prev[id] ? prev : { ...prev, [id]: true }))
   }, [])
 
-  const handleCardClick = useCallback((path: string) => {
-    navigate(path)
-  }, [navigate])
-
   return (
-    <div className="h-dvh flex flex-col overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
+    <div className="min-h-dvh flex flex-col" style={{ background: 'var(--bg-primary)' }}>
       <Navbar />
+      <main className="flex-1 relative z-10">
+        <div className="max-w-6xl mx-auto px-5 sm:px-6 lg:px-8 py-10 lg:py-14">
+          <header className="text-center mb-12 lg:mb-16">
+            <h1 className="section-title">相册表盘模板库</h1>
+            <p className="max-w-2xl mx-auto" style={{ color: 'var(--text-secondary)', fontSize: 14, marginTop: 8 }}>
+              选择一款心仪的相册表盘，上传图片 DIY 专属表盘
+            </p>
+          </header>
 
-      <main className="flex-1 relative z-10 overflow-auto no-scrollbar">
-        <div className="max-w-4xl mx-auto px-4 lg:px-8 py-10 lg:py-16">
-          <div className="text-center mb-10 lg:mb-14">
-            <h1 className="section-title">相册表盘编辑</h1>
-            <p style={{ color: 'var(--text-secondary)', fontSize: 14, marginTop: 8 }}>定制您的专属表盘</p>
-          </div>
+          {state === 'loading' && (
+            <>
+              <p className="sr-only" role="status">正在加载模板…</p>
+              <div className={GRID_CLASS}>
+                {Array.from({ length: SKELETON_COUNT }, (_, i) => <CardSkeleton key={i} />)}
+              </div>
+            </>
+          )}
 
-          {/* 全部模板（内置 + 管理端创建） */}
-          <div className="flex justify-center gap-4 flex-wrap">
-            {BUILTIN_CARDS.map(card => (
-              <div
-                key={card.path}
-                className="p-6 lg:p-8 rounded-xl transition-all flex flex-col items-center justify-center cursor-pointer"
-                style={{
-                  background: 'var(--bg-secondary)',
-                  boxShadow: 'var(--shadow-card)',
-                  minHeight: '160px',
-                  width: '260px',
-                }}
-                onClick={() => handleCardClick(card.path)}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.transform = 'translateY(-2px)'
-                  e.currentTarget.style.boxShadow = 'var(--shadow-elevated)'
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.transform = 'translateY(0)'
-                  e.currentTarget.style.boxShadow = 'var(--shadow-card)'
-                }}
-              >
-                <h3 className="text-lg font-semibold text-center" style={{ color: 'var(--text-primary)' }}>{card.label}</h3>
-                <p className="text-xs mt-1" style={{ color: 'var(--text-secondary)' }}>{card.sub}</p>
-              </div>
-            ))}
-            {templates.map(tpl => (
-              <div
-                key={tpl.id}
-                className="p-4 lg:p-5 rounded-xl transition-all flex flex-col items-center justify-center cursor-pointer"
-                style={{
-                  background: 'var(--bg-secondary)',
-                  boxShadow: 'var(--shadow-card)',
-                  minHeight: '160px',
-                  width: '260px',
-                }}
-                onClick={() => handleCardClick(`/tools/watch-face/edit-template/${tpl.id}`)}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.transform = 'translateY(-2px)'
-                  e.currentTarget.style.boxShadow = 'var(--shadow-elevated)'
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.transform = 'translateY(0)'
-                  e.currentTarget.style.boxShadow = 'var(--shadow-card)'
-                }}
-              >
-                <h3 className="text-sm lg:text-base font-semibold text-center" style={{ color: 'var(--text-primary)' }}>「{tpl.name}」</h3>
-              </div>
-            ))}
-          </div>
+          {state === 'error' && (
+            <StatePanel
+              tone="danger"
+              title="模板加载失败"
+              hint="请检查网络后重试，或稍后再来看看"
+              action={{ label: '重新加载', onClick: () => setReloadKey(k => k + 1) }}
+            />
+          )}
+
+          {state === 'ready' && templates.length === 0 && (
+            <StatePanel
+              tone="muted"
+              title="暂无模板"
+              hint="模板正在准备中，稍后再来看看"
+            />
+          )}
+
+          {state === 'ready' && templates.length > 0 && (
+            <div className={GRID_CLASS}>
+              {templates.map(template => (
+                <button
+                  key={template.id}
+                  type="button"
+                  className="tpl-card"
+                  onClick={() => openTemplate(template.id)}
+                >
+                  <div
+                    className={
+                      'tpl-card__cover' +
+                      (template.preview_image && !loadedCovers[template.id] ? ' is-loading' : '')
+                    }
+                  >
+                    {template.preview_image ? (
+                      // 封面是装饰性的：卡片名由下面的文字提供，避免读屏重复念一遍
+                      <img
+                        src={assetUrl(template.preview_image)}
+                        alt=""
+                        loading="lazy"
+                        decoding="async"
+                        onLoad={() => markCoverLoaded(template.id)}
+                        // 命中缓存时 load 事件可能早于 React 挂载，这里补一次判断，避免微光一直转
+                        ref={el => { if (el?.complete) markCoverLoaded(template.id) }}
+                      />
+                    ) : (
+                      <div className="tpl-card__cover-empty">暂无封面</div>
+                    )}
+                  </div>
+                  <div className="tpl-card__body">
+                    <span className="tpl-card__name" title={template.name}>{template.name}</span>
+                    <span className="tpl-card__go" aria-hidden="true">
+                      <ChevronRight className="w-4 h-4" />
+                    </span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </main>
     </div>

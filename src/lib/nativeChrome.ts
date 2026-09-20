@@ -9,7 +9,7 @@ export async function setupNativeChrome(): Promise<void> {
     // 浅色背景 → 黑色图标（Style.Light = 深色图标）
     await StatusBar.setStyle({ style: Style.Light })
     try {
-      await StatusBar.setBackgroundColor({ color: '#f9f9f9' })
+      await StatusBar.setBackgroundColor({ color: '#ffffff' })
     } catch { /* 部分 WebView 忽略 */ }
   } catch (err) {
     console.warn('[nativeChrome] StatusBar 初始化失败', err)

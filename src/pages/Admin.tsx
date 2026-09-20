@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Link } from 'react-router-dom'
 import { Navbar } from '@/components/Navbar'
 import { apiFetch, apiUpload, apiUploadTo, API_BASE } from '@/lib/api'
+import { DEFAULT_TERMS_SETTINGS, type TermsSettings } from '@/lib/termsContent'
 import { toExternalUrl } from '@/lib/utils'
-import { Plus, Trash2, Save, Upload, LogOut, Settings, EyeOff, Eye, ChevronRight, Check, Menu, X, GripVertical, PanelsTopLeft, Package, Download, Loader2 } from 'lucide-react'
+import { Plus, Trash2, Save, Upload, LogOut, Settings, EyeOff, Eye, ChevronRight, Check, Menu, X, GripVertical, PanelsTopLeft, Package, Download, Loader2, FileText } from 'lucide-react'
+import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { GalleryAdmin } from '@/pages/Gallery'
 import { TemplateCreator } from '@/pages/TemplateCreator'
 
@@ -33,7 +34,7 @@ const EMPTY_RESOURCE: Resource = {
 
 const ALL_DEVICES = ['小米手环 9 Pro', '小米手环 10', '小米手环 10 Pro', 'REDMI Watch 6']
 
-type Tab = 'resources' | 'gallery' | 'homepage' | 'template' | 'settings'
+type Tab = 'resources' | 'gallery' | 'homepage' | 'template' | 'notice' | 'terms' | 'settings'
 
 export function Admin() {
   const [username, setUsername] = useState('')
@@ -249,7 +250,7 @@ export function Admin() {
   }
 
   // --- 已登录 ---
-  const pageTitle = tab === 'settings' ? '设置' : tab === 'gallery' ? '相册图片资源库管理' : tab === 'homepage' ? '首页内容' : tab === 'template' ? '模板管理' : '资源管理'
+  const pageTitle = tab === 'settings' ? '设置' : tab === 'gallery' ? '相册图片资源库管理' : tab === 'homepage' ? '首页内容' : tab === 'template' ? '模板管理' : tab === 'notice' ? '入站提醒' : tab === 'terms' ? '协议内容' : '资源管理'
 
   return (
     <div className="h-dvh flex flex-col overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
@@ -311,12 +312,24 @@ export function Admin() {
               <span className="w-4 h-4 flex-shrink-0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><path d="M12 8v8"/><path d="M8 12h8"/></svg></span>
               模板管理
             </button>
-            <Link to="/" onClick={() => setSidebarOpen(false)}
+            <button onClick={() => switchTab('notice')}
               className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all text-left"
-              style={{ color: 'var(--text-secondary)' }}>
-              <PanelsTopLeft className="w-4 h-4 flex-shrink-0" />
-              官网首页
-            </Link>
+              style={{
+                background: tab === 'notice' ? 'var(--accent-bg)' : 'transparent',
+                color: tab === 'notice' ? 'var(--accent)' : 'var(--text-secondary)',
+              }}>
+              <span className="w-4 h-4 flex-shrink-0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span>
+              入站提醒
+            </button>
+            <button onClick={() => switchTab('terms')}
+              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all text-left"
+              style={{
+                background: tab === 'terms' ? 'var(--accent-bg)' : 'transparent',
+                color: tab === 'terms' ? 'var(--accent)' : 'var(--text-secondary)',
+              }}>
+              <FileText className="w-4 h-4 flex-shrink-0" />
+              协议内容
+            </button>
             <button onClick={() => switchTab('settings')}
               className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all text-left"
               style={{
@@ -366,8 +379,13 @@ export function Admin() {
               )}
             </div>
 
+            <ErrorBoundary resetKey={tab}>
             {tab === 'settings' ? (
               <SettingsPanel msg={msg} setMsg={setMsg} defaultAuthor={defaultAuthor} setDefaultAuthor={setDefaultAuthor} />
+            ) : tab === 'notice' ? (
+              <EntryNoticeAdmin msg={msg} setMsg={setMsg} />
+            ) : tab === 'terms' ? (
+              <TermsAdmin />
             ) : tab === 'gallery' ? (
               <GalleryAdmin />
             ) : tab === 'homepage' ? (
@@ -426,6 +444,7 @@ export function Admin() {
                 </div>
               </div>
             )}
+            </ErrorBoundary>
           </div>
         </main>
       </div>
@@ -449,6 +468,26 @@ function ResourceEditor({ editing, setEditing, isNew, saving, msg, onSave, onCan
   onToggleHidden: (id: string) => void
   onDeleteFile: (url: string) => void
 }) {
+  // 自定义标签：常用机型点一下就能加，其它名字用输入框自己加
+  const [newTag, setNewTag] = useState('')
+  const customTags = editing.devices.filter(d => !ALL_DEVICES.includes(d))
+
+  const addTag = () => {
+    const name = newTag.trim()
+    if (!name) return
+    setNewTag('')
+    if (editing.devices.includes(name)) return
+    setEditing({ ...editing, devices: [...editing.devices, name] })
+  }
+
+  const removeTag = (name: string) => {
+    setEditing({
+      ...editing,
+      devices: editing.devices.filter(x => x !== name),
+      device_options: editing.device_options.filter(opt => opt.id !== name),
+    })
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -567,8 +606,8 @@ function ResourceEditor({ editing, setEditing, isNew, saving, msg, onSave, onCan
         </Field>
       </Section>
 
-      <Section title="设备与价格">
-        <Field label="适配设备">
+      <Section title="标签与价格">
+        <Field label="适配机型 / 标签">
           <div className="flex flex-wrap gap-2">
             {ALL_DEVICES.map(d => {
               const checked = editing.devices.includes(d)
@@ -590,6 +629,40 @@ function ResourceEditor({ editing, setEditing, isNew, saving, msg, onSave, onCan
               )
             })}
           </div>
+
+          {/* 自定义标签：上面那排是常用机型，这里可以加任意名字 */}
+          <div className="flex items-center gap-2 mt-2">
+            <input value={newTag} onChange={e => setNewTag(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addTag() } }}
+              placeholder="输入新的标签名，回车或点右侧按钮添加"
+              className="flex-1 px-4 py-2.5 rounded-xl text-sm outline-none"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+            <button onClick={addTag} disabled={!newTag.trim()}
+              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-xs font-medium text-white transition-opacity disabled:opacity-40"
+              style={{ background: 'var(--gradient-accent)' }}>
+              <Plus className="w-3.5 h-3.5" /> 添加标签
+            </button>
+          </div>
+
+          {customTags.length > 0 && (
+            <div className="flex flex-wrap gap-2 mt-2">
+              {customTags.map(d => (
+                <span key={d} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium"
+                  style={{ background: 'var(--accent-bg)', color: 'var(--accent)', border: '1px solid var(--accent)' }}>
+                  {d}
+                  <button onClick={() => removeTag(d)} title="移除这个标签"
+                    className="p-0.5 rounded-md transition-opacity hover:opacity-60">
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
+          <p className="text-[11px] mt-2" style={{ color: 'var(--text-muted)' }}>
+            标签用于用户端的机型筛选，并在下方「下载文件」里逐个上传对应文件。
+            自定义标签只属于这个资源，不会进「模板管理 → 设备名称」的名单。
+          </p>
         </Field>
         <Field label="价格">
           <div className="flex items-center gap-3">
@@ -619,7 +692,7 @@ function ResourceEditor({ editing, setEditing, isNew, saving, msg, onSave, onCan
 
       <Section title="下载文件">
         {editing.devices.length === 0 ? (
-          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>请先在上方勾选适配设备</p>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>请先在上方添加标签</p>
         ) : (
           <div className="space-y-2">
             {editing.devices.map(device => {
@@ -853,6 +926,170 @@ function apkStatusLabel(job?: ApkJob | null) {
   return job.status
 }
 
+/** 「相册表盘模板」支持的设备名，以及各自被哪些模板引用。
+ *  名单只来自模板表；资源里的标签、相册分类是独立维护的，不在这里出现、也不跟着改名。 */
+interface UsedDevice {
+  name: string
+  count: number
+  templates: { id: number; name: string }[]
+}
+
+/** 把 /api/devices 的返回规范化。
+ *  后端在旧版本里只返回 { name, count }（没有 templates），前端曾直接 d.templates.map()
+ *  取值，一次字段缺失就让整个管理页渲染崩掉变成白屏；这里统一补默认值兜住。 */
+function normalizeUsedDevices(raw: unknown): UsedDevice[] {
+  if (!Array.isArray(raw)) return []
+  const list: UsedDevice[] = []
+  for (const item of raw) {
+    const name = String((item as any)?.name ?? '').trim()
+    if (!name) continue
+    const rawTemplates = (item as any)?.templates
+    const templates = Array.isArray(rawTemplates)
+      ? rawTemplates
+          .filter((t: any) => t && typeof t === 'object')
+          .map((t: any) => ({ id: Number(t.id) || 0, name: String(t.name ?? '').trim() }))
+          .filter(t => t.name)
+      : []
+    const rawCount = Number((item as any)?.count)
+    list.push({
+      name,
+      count: Number.isFinite(rawCount) ? rawCount : templates.length,
+      templates,
+    })
+  }
+  return list
+}
+
+function DeviceRenamePanel({ onRenamed }: { onRenamed: () => void }) {
+  const [devices, setDevices] = useState<UsedDevice[]>([])
+  const [loading, setLoading] = useState(true)
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState('')
+
+  const load = useCallback(async () => {
+    try {
+      const list = await apiFetch('/api/devices')
+      setDevices(normalizeUsedDevices(list))
+      setMsg('')
+    } catch (err: any) {
+      setMsg(err.message || '加载设备名称失败')
+    }
+    setLoading(false)
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  const startRename = (name: string) => {
+    setRenaming(name)
+    setDraft(name)
+    setMsg('')
+  }
+
+  const submitRename = async () => {
+    if (!renaming) return
+    const to = draft.trim()
+    if (!to) { setMsg('请输入新的设备名称'); return }
+    if (to === renaming) { setMsg('新名称和原名一样，无需修改'); return }
+    setBusy(true)
+    setMsg('')
+    try {
+      const r = await apiFetch('/api/devices/rename', {
+        method: 'POST',
+        body: JSON.stringify({ from: renaming, to }),
+      })
+      const names = Array.isArray(r.names) ? r.names : []
+      const suffix = r.conflicts?.length
+        ? `；注意：${r.conflicts.join('、')} 里改完会出现同名设备重复，请进编辑页去掉一个`
+        : ''
+      setMsg(
+        (r.templates
+          ? `已把「${r.from}」改成「${r.to}」，影响 ${r.templates} 个模板：${names.join('、')}`
+          : `「${r.from}」目前没有出现在任何模板里`) + suffix
+      )
+      setRenaming(null)
+      await load()
+      onRenamed()
+    } catch (err: any) {
+      setMsg(err.message)
+    }
+    setBusy(false)
+  }
+
+  const msgOk = /已把|成功/.test(msg)
+
+  return (
+    <Section title="设备名称（统一修改）">
+      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        这里只列出「相册表盘模板」支持的设备，以及各自被哪些模板引用。
+        改名会一次改掉所有模板里的同名设备；资源里的标签、相册分类是独立维护的，不受影响。
+      </p>
+
+      {msg && (
+        <div className="px-3 py-2 rounded-xl text-xs font-medium" style={{
+          background: msgOk ? 'rgba(52, 199, 89, 0.1)' : 'rgba(255, 59, 48, 0.1)',
+          color: msgOk ? 'var(--success)' : 'var(--danger)',
+        }}>{msg}</div>
+      )}
+
+      {loading ? (
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>加载中...</p>
+      ) : devices.length === 0 ? (
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>还没有任何模板设备</p>
+      ) : (
+        <div className="space-y-2">
+          {devices.map(d => (
+            <div key={d.name} className="flex flex-col sm:flex-row sm:items-center gap-2 p-2.5 rounded-xl"
+              style={{ background: 'var(--bg-tertiary)' }}>
+              {renaming === d.name ? (
+                <>
+                  <input
+                    value={draft}
+                    onChange={e => setDraft(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') submitRename() }}
+                    autoFocus
+                    className="flex-1 px-3 py-1.5 rounded-lg text-sm outline-none"
+                    style={{ background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}
+                  />
+                  <div className="flex items-center gap-1.5">
+                    <button onClick={submitRename} disabled={busy}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium text-white disabled:opacity-50"
+                      style={{ background: 'var(--gradient-accent)' }}>
+                      {busy ? '保存中...' : '保存'}
+                    </button>
+                    <button onClick={() => { setRenaming(null); setMsg('') }}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                      style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}>
+                      取消
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm break-words" style={{ color: 'var(--text-primary)' }}>{d.name}</p>
+                    <p className="text-[11px] mt-0.5 leading-relaxed break-words" style={{ color: 'var(--text-muted)' }}>
+                      {d.templates.length
+                        ? `被 ${d.count} 个模板引用：${d.templates.map(t => t.name).join('、')}`
+                        : `被 ${d.count} 个模板引用`}
+                    </p>
+                  </div>
+                  <button onClick={() => startRename(d.name)}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 self-start sm:self-auto"
+                    style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}>
+                    改名
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Section>
+  )
+}
+
 function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => void }) {
   const [view, setView] = useState<'list' | 'create' | 'edit'>('list')
   const [editData, setEditData] = useState<any>(null)
@@ -1002,6 +1239,8 @@ function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => 
         每个模板可独立打包离线 APK（GitHub Actions 编译，包名 top.poolux.album.t{'{id}'}，图标 dark.svg）
       </p>
 
+      <DeviceRenamePanel onRenamed={() => { void load() }} />
+
       {templates.length === 0 ? (
         <div className="text-center py-12 rounded-2xl" style={{ background: 'var(--bg-secondary)' }}>
           <p className="text-sm" style={{ color: 'var(--text-muted)' }}>暂无模板</p>
@@ -1077,6 +1316,299 @@ function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => 
           })}
         </div>
       )}
+    </div>
+  )
+}
+
+// --- 协议内容管理 ---
+function TermsAdmin() {
+  const [settings, setSettings] = useState<TermsSettings>(DEFAULT_TERMS_SETTINGS)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState('')
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const data = await apiFetch('/api/terms') as { initialized: boolean; terms: TermsSettings }
+      setSettings(data.initialized ? data.terms : DEFAULT_TERMS_SETTINGS)
+      setMsg('')
+    } catch (error) {
+      setMsg(error instanceof Error ? error.message : '加载协议内容失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  const update = (key: keyof TermsSettings, value: string) => {
+    setSettings(current => ({ ...current, [key]: value }))
+  }
+
+  const handleSave = async () => {
+    if (!settings.terms_title.trim()) { setMsg('协议标题不能为空'); return }
+    if (!settings.terms_content.trim()) { setMsg('协议正文不能为空'); return }
+    setSaving(true)
+    setMsg('')
+    try {
+      const result = await apiFetch('/api/terms', {
+        method: 'PUT',
+        body: JSON.stringify(settings),
+      }) as { persisted?: boolean; initialized?: boolean; terms?: TermsSettings }
+      if (!result.persisted || !result.initialized || !result.terms) {
+        throw new Error('服务端未确认协议已持久化')
+      }
+      const matches = (Object.keys(settings) as (keyof TermsSettings)[])
+        .every(key => result.terms?.[key] === settings[key])
+      if (!matches) throw new Error('保存后的协议与提交内容不一致')
+      setSettings(result.terms)
+      setMsg('协议保存成功，刷新页面后仍会保留')
+    } catch (error) {
+      setMsg(error instanceof Error ? error.message : '协议保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) {
+    return <div className="py-12 text-center text-sm" style={{ color: 'var(--text-muted)' }}>加载协议内容中...</div>
+  }
+
+  return (
+    <div className="space-y-4">
+      {msg && (
+        <div className="px-4 py-2.5 rounded-xl text-xs font-medium" style={{
+          background: msg.includes('成功') ? 'rgba(52, 199, 89, 0.1)' : 'rgba(255, 59, 48, 0.1)',
+          color: msg.includes('成功') ? 'var(--success)' : 'var(--danger)',
+        }}>{msg}</div>
+      )}
+
+      <Section title="协议基本信息">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="协议标题">
+            <input value={settings.terms_title} onChange={e => update('terms_title', e.target.value)}
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+          </Field>
+          <Field label="更新日期">
+            <input value={settings.terms_updated_at} onChange={e => update('terms_updated_at', e.target.value)}
+              placeholder="如 2026.6.14"
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+          </Field>
+          <Field label="署名">
+            <input value={settings.terms_signature} onChange={e => update('terms_signature', e.target.value)}
+              placeholder="POOLUX Studio"
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} />
+          </Field>
+        </div>
+      </Section>
+
+      <Section title="协议正文">
+        <p className="text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+          正文使用 Markdown：支持标题、粗体、列表、链接、引用、代码和表格；原始 HTML 不会执行。
+        </p>
+        <textarea value={settings.terms_content} onChange={e => update('terms_content', e.target.value)}
+          rows={26}
+          spellCheck={false}
+          className="w-full px-4 py-3 rounded-xl text-sm leading-relaxed outline-none font-mono resize-y"
+          style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)', minHeight: 520 }} />
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            {settings.terms_content.length.toLocaleString()} / 100,000 字符
+          </span>
+          <button onClick={handleSave} disabled={saving}
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium text-white transition-all"
+            style={{ background: 'var(--gradient-accent)', opacity: saving ? 0.6 : 1 }}>
+            <Save className="w-4 h-4" /> {saving ? '保存中...' : '保存协议内容'}
+          </button>
+        </div>
+      </Section>
+    </div>
+  )
+}
+
+// --- 入站提醒 ---
+const EMPTY_NOTICE_SETTINGS: Record<string, string> = {
+  notice_enabled: '0',
+  notice_content: '',
+  notice_first_content: '',
+  notice_button_text: '知道了',
+  notice_auto_close_seconds: '0',
+  notice_expire_at: '',
+}
+
+function EntryNoticeAdmin({ msg, setMsg }: { msg: string; setMsg: (s: string) => void }) {
+  const [settings, setSettings] = useState<Record<string, string>>(EMPTY_NOTICE_SETTINGS)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [previewFirst, setPreviewFirst] = useState(false)
+
+  const load = useCallback(async () => {
+    try {
+      const data = await apiFetch('/api/site-settings') as Record<string, string>
+      setSettings({ ...EMPTY_NOTICE_SETTINGS, ...data })
+      setMsg('')
+    } catch (err: any) {
+      setMsg(err.message || '加载入站提醒失败，请确认后端 API 已启动')
+    }
+    setLoading(false)
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  const update = (key: string, value: string) => setSettings(prev => ({ ...prev, [key]: value }))
+
+  const handleSave = async () => {
+    setSaving(true)
+    setMsg('')
+    try {
+      // 只提交提醒相关的字段：站点文案在「首页内容」里改，避免互相覆盖
+      const payload = {
+        notice_enabled: settings.notice_enabled === '1' ? '1' : '0',
+        notice_content: settings.notice_content || '',
+        notice_first_content: settings.notice_first_content || '',
+        notice_button_text: settings.notice_button_text || '知道了',
+        notice_auto_close_seconds: String(Math.max(0, Math.round(Number(settings.notice_auto_close_seconds) || 0))),
+        notice_expire_at: settings.notice_expire_at || '',
+      }
+      const result = await apiFetch('/api/site-settings', { method: 'PUT', body: JSON.stringify(payload) })
+      if (result?.settings) setSettings({ ...EMPTY_NOTICE_SETTINGS, ...result.settings })
+      setMsg('保存成功')
+    } catch (err: any) {
+      setMsg(err.message)
+    }
+    setSaving(false)
+  }
+
+  if (loading) return <div className="py-8 text-center" style={{ color: 'var(--text-muted)' }}>加载中...</div>
+
+  const enabled = settings.notice_enabled === '1'
+  const previewText = (previewFirst
+    ? (settings.notice_first_content || settings.notice_content)
+    : settings.notice_content) || '（还没填写内容）'
+
+  return (
+    <div className="max-w-2xl space-y-4">
+      {msg && (
+        <div className="px-4 py-2.5 rounded-xl text-xs font-medium" style={{
+          background: msg.includes('成功') ? 'rgba(52, 199, 89, 0.1)' : 'rgba(255, 59, 48, 0.1)',
+          color: msg.includes('成功') ? 'var(--success)' : 'var(--danger)',
+        }}>{msg}</div>
+      )}
+
+      <Section title="入站提醒">
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+          用户每次进入网站都会弹出这个提醒；首次进入（本机浏览器没关过提醒）可以显示另一份内容。
+        </p>
+
+        <label className="flex items-center gap-3 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={e => update('notice_enabled', e.target.checked ? '1' : '0')}
+            className="w-4 h-4 accent-[var(--accent)]"
+          />
+          <span className="text-sm" style={{ color: 'var(--text-primary)' }}>
+            启用入站提醒{enabled ? '' : '（当前已关闭，用户端不会弹出）'}
+          </span>
+        </label>
+
+        <Field label="每次进入显示的内容">
+          <textarea
+            value={settings.notice_content || ''}
+            onChange={e => update('notice_content', e.target.value)}
+            rows={5}
+            placeholder={'第一行作为标题显示，其余行作为正文。\n例如：本站已上新一批表盘模板，欢迎体验。'}
+            className="w-full px-4 py-2.5 rounded-xl text-sm outline-none resize-y"
+            style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }}
+          />
+        </Field>
+
+        <Field label="首次进入显示的内容（留空则和上面一致）">
+          <textarea
+            value={settings.notice_first_content || ''}
+            onChange={e => update('notice_first_content', e.target.value)}
+            rows={4}
+            placeholder={'例如：欢迎第一次来到 POOLUX！\n建议使用 Edge / Chrome 浏览器获得完整效果。'}
+            className="w-full px-4 py-2.5 rounded-xl text-sm outline-none resize-y"
+            style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }}
+          />
+        </Field>
+
+        <Field label="用户端按钮文字">
+          <input
+            value={settings.notice_button_text || ''}
+            onChange={e => update('notice_button_text', e.target.value)}
+            placeholder="知道了"
+            className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+            style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }}
+          />
+        </Field>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Field label="自动关闭倒计时（秒，0 = 不自动关闭）">
+            <input
+              type="number"
+              min={0}
+              max={3600}
+              value={settings.notice_auto_close_seconds || '0'}
+              onChange={e => update('notice_auto_close_seconds', e.target.value)}
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }}
+            />
+          </Field>
+          <Field label="自动关闭时间（东八区 UTC+8）">
+            <input
+              type="datetime-local"
+              value={(settings.notice_expire_at || '').slice(0, 16)}
+              onChange={e => update('notice_expire_at', e.target.value)}
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }}
+            />
+          </Field>
+        </div>
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+          倒计时到达秒数后弹窗自动关闭；「自动关闭时间」是指到该时刻之后提醒不再出现（按东八区填写，留空表示不限制）。
+        </p>
+
+        <div className="flex items-center gap-2">
+          <button onClick={handleSave} disabled={saving}
+            className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-medium text-white transition-all"
+            style={{ background: 'var(--gradient-accent)', opacity: saving ? 0.6 : 1 }}>
+            <Save className="w-4 h-4" /> {saving ? '保存中...' : '保存'}
+          </button>
+          <button onClick={() => setPreviewFirst(p => !p)}
+            className="px-4 py-2.5 rounded-xl text-xs font-medium transition-all"
+            style={{ background: 'var(--bg-tertiary)', color: 'var(--text-secondary)' }}>
+            预览：{previewFirst ? '首次进入' : '非首次进入'}
+          </button>
+        </div>
+      </Section>
+
+      <Section title="用户端预览">
+        <div className="rounded-xl p-4" style={{ background: 'var(--bg-tertiary)' }}>
+          <div className="rounded-xl p-6 max-w-md mx-auto text-center" style={{
+            background: 'var(--bg-secondary)',
+            border: '0.5px solid rgba(0, 0, 0, 0.08)',
+            boxShadow: '0 2px 20px rgba(0, 0, 0, 0.12)',
+          }}>
+            {previewText.split('\n').map((line, i) => (
+              <p key={i} className={i === 0 ? 'text-sm font-medium' : 'text-xs mt-2'} style={{
+                color: i === 0 ? 'var(--text-primary)' : 'var(--text-muted)',
+                whiteSpace: 'pre-wrap',
+              }}>
+                {line || '\u00a0'}
+              </p>
+            ))}
+            <button className="mt-5 px-6 py-2 rounded-md text-sm font-medium text-white" style={{ backgroundColor: 'var(--accent)' }}>
+              {settings.notice_button_text?.trim() || '知道了'}
+            </button>
+          </div>
+        </div>
+      </Section>
     </div>
   )
 }

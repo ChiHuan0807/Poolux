@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 
 type Theme = 'light' | 'dark'
 
@@ -10,33 +10,17 @@ interface ThemeContextType {
 const ThemeContext = createContext<ThemeContextType>({ theme: 'light', toggleTheme: () => {} })
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setTheme] = useState<Theme>(() => {
-    const saved = localStorage.getItem('theme')
-    if (saved === 'dark' || saved === 'light') return saved
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-  })
-
-  const userToggledRef = useRef(false)
+  // 站点整体背景固定为 #FFFFFF，不再跟随系统深色模式。
+  // （之前会读 localStorage / prefers-color-scheme 自动切深色，但顶栏并没有暴露切换按钮，
+  //  结果深色 OS 的访客会在内页看到深色背景，与「整体白色」不符。）
+  // 深色变量仍保留在 index.css 的 [data-theme="dark"] 中，将来要恢复只需改回这里。
+  const [theme, setTheme] = useState<Theme>('light')
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
-    localStorage.setItem('theme', theme)
   }, [theme])
 
-  // 监听系统深浅模式变化，自动跟随
-  useEffect(() => {
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const handler = (e: MediaQueryListEvent) => {
-      if (!userToggledRef.current) {
-        setTheme(e.matches ? 'dark' : 'light')
-      }
-    }
-    mq.addEventListener('change', handler)
-    return () => mq.removeEventListener('change', handler)
-  }, [])
-
   const toggleTheme = () => {
-    userToggledRef.current = true
     setTheme(prev => prev === 'light' ? 'dark' : 'light')
   }
 

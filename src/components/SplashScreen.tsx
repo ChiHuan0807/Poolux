@@ -21,7 +21,7 @@ export function SplashScreen({ onDone }: { onDone: () => void }) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: '#f9f9f9',
+        background: '#ffffff',
         transition: 'opacity 0.4s ease-out',
         opacity: fade ? 0 : 1,
       }}

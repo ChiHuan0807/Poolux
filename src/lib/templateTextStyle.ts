@@ -15,6 +15,12 @@ export interface TextStyleLayer {
   text_vertical_align?: string
   line_height?: number
   letter_spacing?: number
+  /** 手动描边配置（优先于 CSS 中解析出的描边） */
+  text_stroke_type?: 'outset' | 'center' | 'inset'
+  text_stroke_size?: number
+  text_stroke_color_mode?: 'fixed' | 'picker'
+  text_stroke_color?: string
+  text_stroke_picker_default?: 'dark' | 'light'
 }
 
 export interface ResolvedTextStyle {
@@ -33,6 +39,9 @@ export interface ResolvedTextStyle {
   lineHeightPx: number
   letterSpacingPx: number
   color: string
+  textStrokeType: 'outset' | 'center' | 'inset'
+  textStrokeWidth: number
+  textStrokeColor?: string
   textAlign: CSSProperties['textAlign']
   verticalAlign: 'top' | 'middle' | 'bottom'
 }
@@ -234,6 +243,17 @@ export function resolveTextStyle(layer: TextStyleLayer, deviceWidth: number, dev
   const fontStyle = css['font-style'] || 'normal'
   const lineHeightPx = resolveLineHeightPx(css['line-height'], fontSize, layer.line_height)
   const letterSpacingPx = cssLengthToPx(css['letter-spacing'], fontSize) ?? layer.letter_spacing ?? 0
+  const cssStrokeWidth = cssLengthToPx(css['-webkit-text-stroke-width'] || css['text-stroke-width'], fontSize)
+    ?? cssLengthToPx(css['-webkit-text-stroke'] || css['text-stroke'], fontSize)
+    ?? 0
+  const cssStrokeColor = css['-webkit-text-stroke-color'] || css['text-stroke-color']
+    || css['-webkit-text-stroke']?.trim().split(/\s+/).find(value => CSS.supports('color', value))
+    || css['text-stroke']?.trim().split(/\s+/).find(value => CSS.supports('color', value))
+  // 手动描边配置优先于 CSS；未配置颜色时兜底为黑色
+  const hasManualStroke = layer.text_stroke_size != null
+  const textStrokeWidth = hasManualStroke ? layer.text_stroke_size! : cssStrokeWidth
+  const textStrokeColor = layer.text_stroke_color || cssStrokeColor || (textStrokeWidth > 0 ? '#000000' : undefined)
+  const textStrokeType = layer.text_stroke_type ?? 'center'
 
   return {
     css,
@@ -251,7 +271,15 @@ export function resolveTextStyle(layer: TextStyleLayer, deviceWidth: number, dev
     lineHeightPx,
     letterSpacingPx,
     color: css.color || layer.text_color || '#FFFFFF',
+    textStrokeType,
+    textStrokeWidth,
+    textStrokeColor,
     textAlign,
     verticalAlign,
   }
+}
+
+/** DOM 预览使用的描边线宽：居中描边按设定值，外/内描边翻倍以补偿 fill 覆盖的一半。 */
+export function textStrokeLineWidth(style: Pick<ResolvedTextStyle, 'textStrokeType' | 'textStrokeWidth'>): number {
+  return style.textStrokeType === 'center' ? style.textStrokeWidth : style.textStrokeWidth * 2
 }

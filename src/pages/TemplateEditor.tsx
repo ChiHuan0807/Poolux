@@ -1,749 +1,100 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { Navbar } from '@/components/Navbar'
+import { WatchFaceLayerStack } from '@/components/WatchFaceLayerStack'
 import { apiFetch, API_BASE } from '@/lib/api'
 import { IS_OFFLINE, offlineAsset } from '@/lib/offline'
 import { savePngBlob, isNativeApp } from '@/lib/saveImage'
-import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssRotation, resolveCssTranslation, resolveTextStyle, stripTranslateTransform } from '@/lib/templateTextStyle'
+import { cssLengthToPx, normalizeFontFaceStyle, parseCssDeclarations, resolveCssRotation, resolveCssTranslation, resolveTextStyle, stripTranslateTransform, textStrokeLineWidth } from '@/lib/templateTextStyle'
+import { extractImageColors, selectPaletteColor } from '@/lib/imagePalette'
 import { snapToEdges } from '@/lib/snapToEdges'
-import { ArrowLeft, X, RotateCcw, Download, Palette, Trash2 } from 'lucide-react'
-
-/* ── 类型 ── */
-interface Layer {
-  name: string
-  css_code: string
-  type: 'color' | 'image' | 'svg' | 'shape' | 'text'
-  color_mode?: 'fixed' | 'picker'
-  color?: string
-  picker_default?: 'dark' | 'light'
-  allow_user_upload?: boolean
-  image_url?: string
-  show_on_client?: boolean
-  z_index?: number
-  x?: number
-  y?: number
-  css_width?: number
-  css_height?: number
-  css_position_code?: string
-  font_size?: number
-  font_family?: string
-  font_weight?: string
-  line_height?: number
-  letter_spacing?: number
-  text_color?: string
-  text_content?: string
-  text_align?: string
-  text_vertical_align?: string
-  effects?: { opacity: number; blur_type: 'none' | 'gaussian' | 'backdrop'; blur_value: number }
-  visible_in_export?: boolean
-  adjustments?: { rotation?: number; scale?: number; blur?: number; contrast?: number; brightness?: number }
-  group_id?: string
-}
-
-interface DeviceConfig {
-  name: string
-  width: number
-  height: number
-  corner_radius: number
-  background?: string
-  layers: Layer[]
-}
-
-interface Template {
-  id: number
-  name: string
-  devices: DeviceConfig[]
-  preview_image: string
-  created_at: string
-  updated_at: string
-}
-
-interface LayerState {
-  imageUrl?: string
-  naturalWidth?: number
-  naturalHeight?: number
-  position: { x: number; y: number }
-  scale: number
-  rotation: number
-}
-
-type DragMode = 'move' | 'scale-tl' | 'scale-tr' | 'scale-bl' | 'scale-br' | 'rotate-tl' | 'rotate-tr' | 'rotate-bl' | 'rotate-br' | 'pinch-rotate'
-
-/** 双指旋转松手时，角度距 90° 整数倍在 15° 以内则自动吸附 */
-function snapRotation(deg: number): number {
-  const nearest = Math.round(deg / 90) * 90
-  return Math.abs(deg - nearest) < 5 ? nearest : deg
-}
-
-/* ── 常量 ── */
-const PAD = 20
-const HANDLE_R = 7
-const ROT_HANDLE_R = 6
-const ROT_HANDLE_OFFSET = 36
-const EXPORT_SCALE = 2
-
-/* ── CSS 解析 ── */
-function toReactKey(key: string): string {
-  return key.replace(/-([a-z])/g, (_, c) => c.toUpperCase())
-}
-
-function fitSvgToContainer(html: string): string {
-  return html.replace(/<svg\b([^>]*)>/i, (_match, attrs: string) => {
-    const withoutRootSize = attrs.replace(/\s(?:width|height)\s*=\s*(?:"[^"]*"|'[^']*')/gi, '')
-    const styleMatch = withoutRootSize.match(/\sstyle\s*=\s*(["'])(.*?)\1/i)
-    if (styleMatch) {
-      const mergedStyle = `${styleMatch[2].replace(/;?\s*$/, ';')}width:100%;height:100%;pointer-events:none`
-      return `<svg${withoutRootSize.replace(styleMatch[0], ` style="${mergedStyle}"`)}>`
-    }
-    return `<svg${withoutRootSize} style="width:100%;height:100%;pointer-events:none">`
-  })
-}
-
-/** picker 模式必须覆盖 SVG 内的显式 fill/stroke，否则只设置外层 color 不会产生视觉变化。 */
-function applySvgColor(html: string, color: string | undefined): string {
-  if (!color) return html
-  try {
-    const doc = new DOMParser().parseFromString(html, 'image/svg+xml')
-    if (doc.querySelector('parsererror')) return html
-    const root = doc.documentElement
-    root.setAttribute('fill', color)
-    root.setAttribute('color', color)
-    const elements = [root, ...Array.from(root.querySelectorAll('*'))]
-    elements.forEach(element => {
-      for (const property of ['fill', 'stroke'] as const) {
-        const value = element.getAttribute(property)
-        if (value && !/^(none|transparent)$/i.test(value) && !/^url\s*\(/i.test(value)) {
-          element.setAttribute(property, color)
-        }
-        const inlineValue = (element as SVGElement).style?.getPropertyValue(property)
-        if (inlineValue && !/^(none|transparent)$/i.test(inlineValue) && !/^url\s*\(/i.test(inlineValue)) {
-          ;(element as SVGElement).style.setProperty(property, color)
-        }
-      }
-    })
-    return new XMLSerializer().serializeToString(root)
-  } catch {
-    return html
-  }
-}
-
-function parseCssBlock(raw: string): Record<string, string> {
-  return parseCssDeclarations(raw)
-}
-
-/** 绕过浏览器 CSSOM，直接从原始 CSS 字符串拆分属性。
- *  用于兜底 CSSOM 在不同浏览器中解析
- *  background/border 缩写行为不一致导致渐变/边框丢失的问题。 */
-function getRawCssProps(raw: string): Record<string, string> {
-  const props: Record<string, string> = {}
-  if (!raw) return props
-  const cleaned = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[^{]*\{|\}[^}]*$/g, '').trim()
-  for (const decl of cleaned.split(';')) {
-    const idx = decl.indexOf(':')
-    if (idx < 0) continue
-    const prop = decl.slice(0, idx).trim().toLowerCase()
-    const value = decl.slice(idx + 1).trim()
-    if (prop && value) props[prop] = value
-  }
-  return props
-}
-
-/** 解析图层在设备坐标系中的最终视觉矩形。结构化宽高和 x/y 是 CSS 缺失时的回退。 */
-function resolveLayerRect(
-  layer: Pick<Layer, 'type' | 'x' | 'y' | 'css_width' | 'css_height'>,
-  css: Record<string, string>,
-  deviceW: number,
-  deviceH: number,
-): { left: number; top: number; w: number; h: number } {
-  const defaultSize = layer.type === 'shape' || layer.type === 'svg' ? 100 : undefined
-  const w = cssLengthToPx(css.width, deviceW) ?? layer.css_width ?? defaultSize ?? deviceW
-  const h = cssLengthToPx(css.height, deviceH) ?? layer.css_height ?? defaultSize ?? deviceH
-
-  let left = cssLengthToPx(css.left, deviceW)
-  if (left == null && css.right != null) left = deviceW - (cssLengthToPx(css.right, deviceW) ?? 0) - w
-  left ??= layer.x ?? 0
-
-  let top = cssLengthToPx(css.top, deviceH)
-  if (top == null && css.bottom != null) top = deviceH - (cssLengthToPx(css.bottom, deviceH) ?? 0) - h
-  top ??= layer.y ?? 0
-
-  const translation = resolveCssTranslation(css.transform, w, h)
-  return { left: left + translation.x, top: top + translation.y, w, h }
-}
-
-function getLayerCss(layer: Layer): Record<string, string> {
-  return {
-    ...parseCssBlock(layer.css_code || ''),
-    ...parseCssBlock(layer.css_position_code || ''),
-  }
-}
-
-function getLayerBoxStyle(layer: Layer, css: Record<string, string>, deviceW: number, deviceH: number): React.CSSProperties {
-  const rect = resolveLayerRect(layer, css, deviceW, deviceH)
-  const style = cssToProps(css) as Record<string, unknown>
-  for (const property of [
-    'right', 'bottom', 'inset', 'insetBlock', 'insetInline',
-    'insetBlockStart', 'insetBlockEnd', 'insetInlineStart', 'insetInlineEnd',
-  ]) delete style[property]
-  return {
-    // 结构化层级作为默认值；CSS 中显式 z-index 仍可覆盖，行为与管理端预览一致。
-    zIndex: layer.z_index ?? 0,
-    ...style,
-    left: rect.left,
-    top: rect.top,
-    width: rect.w,
-    height: rect.h,
-    transform: stripTranslateTransform(css.transform),
-  } as React.CSSProperties
-}
-
-/** CSSOM 可能将 border-radius 展开为四个 longhand，统一还原为 CSS 顺序 tl tr br bl。 */
-function resolveBorderRadius(css: Record<string, string>): string | undefined {
-  const shorthand = css['border-radius'] || css.borderRadius
-  if (shorthand) return shorthand
-
-  const topLeft = css['border-top-left-radius'] || css.borderTopLeftRadius
-  const topRight = css['border-top-right-radius'] || css.borderTopRightRadius
-  const bottomRight = css['border-bottom-right-radius'] || css.borderBottomRightRadius
-  const bottomLeft = css['border-bottom-left-radius'] || css.borderBottomLeftRadius
-  if (!topLeft && !topRight && !bottomRight && !bottomLeft) return undefined
-
-  return `${topLeft || '0'} ${topRight || '0'} ${bottomRight || '0'} ${bottomLeft || '0'}`
-}
-
-/** 解析 border-radius → [tl, tr, br, bl]（px） */
-function parseBorderRadius(val: string | undefined): number[] | null {
-  if (!val) return null
-  const parts = val.trim().split(/\s+/).map(s => parseFloat(s) || 0)
-  if (parts.length === 0) return null
-  if (parts.length === 1) return [parts[0], parts[0], parts[0], parts[0]]
-  if (parts.length === 2) return [parts[0], parts[1], parts[0], parts[1]]
-  if (parts.length === 3) return [parts[0], parts[1], parts[2], parts[1]]
-  return [parts[0], parts[1], parts[2], parts[3]]
-}
-
-function parseObjectPosition(value: string | undefined): { x: number; y: number } {
-  const tokens = (value || '50% 50%').trim().toLowerCase().split(/\s+/)
-  const keywordToPercent = (token: string, axis: 'x' | 'y') => {
-    if (token === 'center') return 0.5
-    if ((axis === 'x' && token === 'left') || (axis === 'y' && token === 'top')) return 0
-    if ((axis === 'x' && token === 'right') || (axis === 'y' && token === 'bottom')) return 1
-    if (token.endsWith('%')) {
-      const percent = Number.parseFloat(token)
-      return Number.isFinite(percent) ? percent / 100 : 0.5
-    }
-    return 0.5
-  }
-
-  const first = tokens[0] || '50%'
-  const second = tokens[1]
-  if (!second && (first === 'top' || first === 'bottom')) return { x: 0.5, y: keywordToPercent(first, 'y') }
-  return { x: keywordToPercent(first, 'x'), y: keywordToPercent(second || '50%', 'y') }
-}
-
-function resolveUserImageFit(objectFit: string | undefined): string {
-  const fit = objectFit?.trim().toLowerCase()
-  return !fit || fit === 'fill' ? 'contain' : fit
-}
-
-function getRoundedClipPath(borderRadius: string | undefined): string | undefined {
-  return borderRadius ? `inset(0 round ${borderRadius})` : undefined
-}
-
-function resolveImageDrawRect(
-  imageWidth: number,
-  imageHeight: number,
-  box: { left: number; top: number; width: number; height: number },
-  objectFit: string | undefined,
-  objectPosition: string | undefined,
-) {
-  const fit = (objectFit || 'fill').trim().toLowerCase()
-  const containScale = Math.min(box.width / imageWidth, box.height / imageHeight)
-  const scale = fit === 'contain'
-    ? containScale
-    : fit === 'cover'
-      ? Math.max(box.width / imageWidth, box.height / imageHeight)
-      : fit === 'scale-down'
-        ? Math.min(1, containScale)
-        : 1
-  const width = fit === 'fill' ? box.width : fit === 'none' ? imageWidth : imageWidth * scale
-  const height = fit === 'fill' ? box.height : fit === 'none' ? imageHeight : imageHeight * scale
-  const position = parseObjectPosition(objectPosition)
-  return {
-    left: box.left + (box.width - width) * position.x,
-    top: box.top + (box.height - height) * position.y,
-    width,
-    height,
-  }
-}
-
-function resolveImageFilter(layer: Layer, exportScale = 1): string | undefined {
-  const filters: string[] = []
-  const adjustments = layer.adjustments
-  if (adjustments?.blur && adjustments.blur > 0) filters.push(`blur(${adjustments.blur * exportScale}px)`)
-  if (adjustments?.contrast != null && adjustments.contrast !== 100) filters.push(`contrast(${adjustments.contrast}%)`)
-  if (adjustments?.brightness != null && adjustments.brightness !== 100) filters.push(`brightness(${adjustments.brightness}%)`)
-  if (layer.effects?.blur_type === 'gaussian' && layer.effects.blur_value > 0) {
-    filters.push(`blur(${layer.effects.blur_value * exportScale}px)`)
-  }
-  return filters.join(' ') || undefined
-}
-
-/** Android WebView 的 CanvasRenderingContext2D.filter 可能静默失效；用软件像素处理保留导出滤镜。 */
-function renderSoftwareFilteredImage(
-  image: CanvasImageSource,
-  width: number,
-  height: number,
-  layer: Layer,
-  exportScale: number,
-): HTMLCanvasElement | CanvasImageSource {
-  const adjustments = layer.adjustments
-  const blurValue = Math.max(
-    adjustments?.blur || 0,
-    layer.effects?.blur_type === 'gaussian' ? layer.effects.blur_value : 0,
-  ) * exportScale
-  const contrast = adjustments?.contrast ?? 100
-  const brightness = adjustments?.brightness ?? 100
-  if (blurValue <= 0 && contrast === 100 && brightness === 100) return image
-
-  const canvas = document.createElement('canvas')
-  canvas.width = Math.max(1, Math.ceil(width))
-  canvas.height = Math.max(1, Math.ceil(height))
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return image
-  ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
-
-  let pixels: ImageData
-  try {
-    pixels = ctx.getImageData(0, 0, canvas.width, canvas.height)
-  } catch {
-    return image
-  }
-
-  // 分离的水平/垂直 box blur，近似 Gaussian blur，避免 Android Canvas filter 的兼容性问题。
-  const radius = Math.min(64, Math.max(1, Math.round(blurValue)))
-  if (blurValue > 0) {
-    const source = pixels.data
-    const horizontal = new Uint8ClampedArray(source.length)
-    const windowSize = radius * 2 + 1
-    for (let y = 0; y < canvas.height; y++) {
-      const row = y * canvas.width * 4
-      for (let channel = 0; channel < 4; channel++) {
-        let sum = 0
-        for (let x = -radius; x <= radius; x++) sum += source[row + Math.min(canvas.width - 1, Math.max(0, x)) * 4 + channel]
-        for (let x = 0; x < canvas.width; x++) {
-          horizontal[row + x * 4 + channel] = sum / windowSize
-          const removeX = Math.min(canvas.width - 1, Math.max(0, x - radius))
-          const addX = Math.min(canvas.width - 1, Math.max(0, x + radius + 1))
-          sum += source[row + addX * 4 + channel] - source[row + removeX * 4 + channel]
-        }
-      }
-    }
-    for (let x = 0; x < canvas.width; x++) {
-      for (let channel = 0; channel < 4; channel++) {
-        let sum = 0
-        for (let y = -radius; y <= radius; y++) sum += horizontal[Math.min(canvas.height - 1, Math.max(0, y)) * canvas.width * 4 + x * 4 + channel]
-        for (let y = 0; y < canvas.height; y++) {
-          pixels.data[y * canvas.width * 4 + x * 4 + channel] = sum / windowSize
-          const removeY = Math.min(canvas.height - 1, Math.max(0, y - radius))
-          const addY = Math.min(canvas.height - 1, Math.max(0, y + radius + 1))
-          sum += horizontal[addY * canvas.width * 4 + x * 4 + channel] - horizontal[removeY * canvas.width * 4 + x * 4 + channel]
-        }
-      }
-    }
-  }
-
-  if (contrast !== 100 || brightness !== 100) {
-    const contrastFactor = contrast / 100
-    const brightnessFactor = brightness / 100
-    for (let i = 0; i < pixels.data.length; i += 4) {
-      for (let channel = 0; channel < 3; channel++) {
-        pixels.data[i + channel] = Math.max(0, Math.min(255,
-          ((pixels.data[i + channel] - 128) * contrastFactor + 128) * brightnessFactor,
-        ))
-      }
-    }
-  }
-  ctx.putImageData(pixels, 0, 0)
-  return canvas
-}
-
-interface ParsedBoxShadow {
-  inset: boolean
-  offsetX: number
-  offsetY: number
-  blur: number
-  spread: number
-  color: string
-}
-
-function parseBoxShadow(value: string | undefined): ParsedBoxShadow | null {
-  if (!value || value.trim().toLowerCase() === 'none') return null
-  const colorMatch = value.match(/(#[0-9a-fA-F]{3,8}|rgba?\s*\([^)]+\)|hsla?\s*\([^)]+\))/)
-  const color = colorMatch?.[0] || 'rgba(0,0,0,0.3)'
-  const numericPart = value
-    .replace(/\binset\b/i, '')
-    .replace(color, '')
-  const nums = numericPart.match(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) || []
-  return {
-    inset: /\binset\b/i.test(value),
-    offsetX: nums[0] || 0,
-    offsetY: nums[1] || 0,
-    blur: Math.max(0, nums[2] || 0),
-    spread: nums[3] || 0,
-    color,
-  }
-}
-
-/* ── clip-path 解析 → 多边形顶点 ── */
-/** 将 CSS clip-path 值解析为多边形点数组 [[x,y], ...]（设备坐标系） */
-function parseClipPathToPoints(val: string, w: number, h: number): number[][] | null {
-  const s = val.trim()
-  // polygon(...)
-  const pm = s.match(/polygon\(([\s\S]+)\)/)
-  if (pm) {
-    return pm[1].split(',').map(seg => {
-      const parts = seg.trim().split(/\s+/)
-      const xP = parts[0], yP = parts[1] || '0'
-      const x = xP.endsWith('%') ? parseFloat(xP) / 100 * w : parseFloat(xP)
-      const y = yP.endsWith('%') ? parseFloat(yP) / 100 * h : parseFloat(yP)
-      return [x, y]
-    })
-  }
-  // circle(r at cx cy)
-  const cm = s.match(/circle\(([\s\S]+)\)/)
-  if (cm) {
-    const [rPart, centerPart] = cm[1].split(/\s+at\s+/)
-    const r = rPart.endsWith('%') ? parseFloat(rPart) / 100 * Math.min(w, h) : parseFloat(rPart)
-    const cp = (centerPart || '50% 50%').trim().split(/\s+/)
-    const cx = cp[0].endsWith('%') ? parseFloat(cp[0]) / 100 * w : parseFloat(cp[0])
-    const cy = (cp[1] || '50%').endsWith('%') ? parseFloat(cp[1] || '50%') / 100 * h : parseFloat(cp[1] || '50%')
-    const pts: number[][] = []
-    const N = 48
-    for (let i = 0; i < N; i++) {
-      const a = (i / N) * 2 * Math.PI
-      pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)])
-    }
-    return pts
-  }
-  // ellipse(rx ry at cx cy)
-  const em = s.match(/ellipse\(([\s\S]+)\)/)
-  if (em) {
-    const [rPart, centerPart] = em[1].split(/\s+at\s+/)
-    const rp = rPart.trim().split(/\s+/)
-    const rx = rp[0].endsWith('%') ? parseFloat(rp[0]) / 100 * w : parseFloat(rp[0])
-    const ry = (rp[1] || rp[0]).endsWith('%') ? parseFloat(rp[1] || rp[0]) / 100 * h : parseFloat(rp[1] || rp[0])
-    const cp = (centerPart || '50% 50%').trim().split(/\s+/)
-    const cx = cp[0].endsWith('%') ? parseFloat(cp[0]) / 100 * w : parseFloat(cp[0])
-    const cy = (cp[1] || '50%').endsWith('%') ? parseFloat(cp[1] || '50%') / 100 * h : parseFloat(cp[1] || '50%')
-    const pts: number[][] = []
-    const N = 48
-    for (let i = 0; i < N; i++) {
-      const a = (i / N) * 2 * Math.PI
-      pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)])
-    }
-    return pts
-  }
-  // inset(t r b l round ...)
-  const im = s.match(/inset\(([\s\S]+)\)/)
-  if (im) {
-    const full = im[1]
-    const roundIdx = full.toLowerCase().indexOf('round')
-    const dimStr = roundIdx >= 0 ? full.slice(0, roundIdx) : full
-    const dims = dimStr.trim().split(/\s+/)
-    const t = dims[0].endsWith('%') ? parseFloat(dims[0]) / 100 * h : parseFloat(dims[0])
-    const r = (dims[1] || dims[0]).endsWith('%') ? parseFloat(dims[1] || dims[0]) / 100 * w : parseFloat(dims[1] || dims[0])
-    const b = (dims[2] || dims[0]).endsWith('%') ? parseFloat(dims[2] || dims[0]) / 100 * h : parseFloat(dims[2] || dims[0])
-    const l = (dims[3] || dims[1] || dims[0]).endsWith('%') ? parseFloat(dims[3] || dims[1] || dims[0]) / 100 * w : parseFloat(dims[3] || dims[1] || dims[0])
-    // 解析 round 后的 border-radius
-    let br = 0
-    if (roundIdx >= 0) {
-      const radiiStr = full.slice(roundIdx + 5).trim()
-      br = parseFloat(radiiStr) || 0
-    }
-    if (br > 0) {
-      // 带圆角的 inset → 圆角矩形顶点
-      const pts: number[][] = []
-      const lx = l, rx2 = w - r, ty = t, by = h - b
-      const iw = rx2 - lx, ih = by - ty
-      const cr = Math.min(br, iw / 2, ih / 2)
-      const step = 6
-      // top-left
-      for (let i = step; i >= 0; i--) {
-        const a = Math.PI + (Math.PI / 2) * (i / step)
-        pts.push([lx + cr + cr * Math.cos(a), ty + cr + cr * Math.sin(a)])
-      }
-      // top-right
-      for (let i = 0; i <= step; i++) {
-        const a = -Math.PI / 2 + (Math.PI / 2) * (i / step)
-        pts.push([rx2 - cr + cr * Math.cos(a), ty + cr + cr * Math.sin(a)])
-      }
-      // bottom-right
-      for (let i = 0; i <= step; i++) {
-        const a = 0 + (Math.PI / 2) * (i / step)
-        pts.push([rx2 - cr + cr * Math.cos(a), by - cr + cr * Math.sin(a)])
-      }
-      // bottom-left
-      for (let i = 0; i <= step; i++) {
-        const a = Math.PI / 2 + (Math.PI / 2) * (i / step)
-        pts.push([lx + cr + cr * Math.cos(a), by - cr + cr * Math.sin(a)])
-      }
-      return pts
-    }
-    return [[l, t], [w - r, t], [w - r, h - b], [l, h - b]]
-  }
-  return null
-}
-
-/** 将多边形点数组转为 SVG polygon points 属性 */
-function pointsToSvgAttr(pts: number[][]): string {
-  return pts.map(p => `${p[0]},${p[1]}`).join(' ')
-}
-
-/** 在 canvas 上绘制 clip-path 多边形并填充 */
-function fillClipPath(ctx: CanvasRenderingContext2D, pts: number[][]) {
-  if (pts.length < 2) return
-  ctx.beginPath()
-  ctx.moveTo(pts[0][0], pts[0][1])
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1])
-  ctx.closePath()
-  ctx.fill()
-}
-
-/** 检查 CSS 中是否含有 clip-path（含 -webkit- 前缀） */
-function getClipPath(css: Record<string, string>): string | null {
-  return css['-webkit-clip-path'] || css['clip-path'] || null
-}
-
-function cssToProps(css: Record<string, string>): React.CSSProperties {
-  const style: Record<string, any> = {}
-  for (const [key, val] of Object.entries(css)) {
-    if (key === 'display' || key === 'position' || key === 'float' || key === 'clear') continue
-    style[toReactKey(key)] = val
-  }
-  style.position = 'absolute'
-  return style as React.CSSProperties
-}
-
-/** 仅在 CSS 函数最外层拆分参数，避免 rgba()/calc() 内部逗号破坏渐变色标。 */
-function splitTopLevelCssArgs(value: string): string[] {
-  const parts: string[] = []
-  let start = 0
-  let depth = 0
-  let quote = ''
-  for (let index = 0; index < value.length; index++) {
-    const char = value[index]
-    if (quote) {
-      if (char === quote && value[index - 1] !== '\\') quote = ''
-      continue
-    }
-    if (char === '"' || char === "'") { quote = char; continue }
-    if (char === '(') depth++
-    else if (char === ')') depth = Math.max(0, depth - 1)
-    else if (char === ',' && depth === 0) {
-      parts.push(value.slice(start, index).trim())
-      start = index + 1
-    }
-  }
-  parts.push(value.slice(start).trim())
-  return parts.filter(Boolean)
-}
-
-function parseGradientStop(value: string): { color: string; offset?: number } {
-  let depth = 0
-  let quote = ''
-  let splitAt = -1
-  for (let index = 0; index < value.length; index++) {
-    const char = value[index]
-    if (quote) {
-      if (char === quote && value[index - 1] !== '\\') quote = ''
-      continue
-    }
-    if (char === '"' || char === "'") { quote = char; continue }
-    if (char === '(') depth++
-    else if (char === ')') depth = Math.max(0, depth - 1)
-    else if (/\s/.test(char) && depth === 0) splitAt = index
-  }
-
-  if (splitAt >= 0) {
-    const offsetText = value.slice(splitAt).trim()
-    if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(offsetText)) {
-      return {
-        color: value.slice(0, splitAt).trim(),
-        offset: Math.min(1, Math.max(0, Number.parseFloat(offsetText) / 100)),
-      }
-    }
-  }
-  return { color: value.trim() }
-}
-
-function resolveGradientOffsets(stops: { color: string; offset?: number }[]) {
-  const resolved = stops.map(stop => ({ ...stop }))
-  if (resolved.length === 0) return resolved as { color: string; offset: number }[]
-  resolved[0].offset ??= 0
-  resolved[resolved.length - 1].offset ??= 1
-
-  let anchor = 0
-  while (anchor < resolved.length - 1) {
-    let next = anchor + 1
-    while (next < resolved.length && resolved[next].offset == null) next++
-    const startOffset = resolved[anchor].offset ?? 0
-    const endOffset = resolved[next]?.offset ?? startOffset
-    const distance = next - anchor
-    for (let index = anchor + 1; index < next; index++) {
-      resolved[index].offset = startOffset + (endOffset - startOffset) * ((index - anchor) / distance)
-    }
-    anchor = next
-  }
-  return resolved as { color: string; offset: number }[]
-}
-
-function gradientAngleToDegrees(value: string): number | null {
-  const normalized = value.trim().toLowerCase()
-  const numeric = Number.parseFloat(normalized)
-  if (normalized.endsWith('deg') && Number.isFinite(numeric)) return numeric
-  if (normalized.endsWith('turn') && Number.isFinite(numeric)) return numeric * 360
-  if (normalized.endsWith('rad') && Number.isFinite(numeric)) return numeric * 180 / Math.PI
-  const directions: Record<string, number> = {
-    'to top': 0,
-    'to top right': 45,
-    'to right top': 45,
-    'to right': 90,
-    'to bottom right': 135,
-    'to right bottom': 135,
-    'to bottom': 180,
-    'to bottom left': 225,
-    'to left bottom': 225,
-    'to left': 270,
-    'to top left': 315,
-    'to left top': 315,
-  }
-  return directions[normalized] ?? null
-}
-
-function createCanvasLinearGradient(
-  ctx: CanvasRenderingContext2D,
-  value: string,
-  box: { left: number; top: number; width: number; height: number },
-): CanvasGradient | null {
-  const match = value.trim().match(/^linear-gradient\(([\s\S]*)\)$/i)
-  if (!match) return null
-  const args = splitTopLevelCssArgs(match[1])
-  if (args.length < 2) return null
-
-  const parsedAngle = gradientAngleToDegrees(args[0])
-  const angle = parsedAngle ?? 180
-  const stopArgs = parsedAngle == null ? args : args.slice(1)
-  const stops = resolveGradientOffsets(stopArgs.map(parseGradientStop))
-  if (stops.length < 2 || stops.some(stop => !stop.color)) return null
-
-  const angleRad = (angle - 90) * Math.PI / 180
-  const centerX = box.left + box.width / 2
-  const centerY = box.top + box.height / 2
-  const halfProjection = (Math.abs(box.width * Math.cos(angleRad)) + Math.abs(box.height * Math.sin(angleRad))) / 2
-  const x1 = centerX - Math.cos(angleRad) * halfProjection
-  const y1 = centerY - Math.sin(angleRad) * halfProjection
-  const x2 = centerX + Math.cos(angleRad) * halfProjection
-  const y2 = centerY + Math.sin(angleRad) * halfProjection
-  const gradient = ctx.createLinearGradient(x1, y1, x2, y2)
-
-  try {
-    stops.forEach(stop => gradient.addColorStop(stop.offset, stop.color))
-    return gradient
-  } catch {
-    return null
-  }
-}
-
-function migrateLayer(l: any, i: number): Layer {
-  const migrated = { ...l, show_on_client: l.show_on_client ?? true }
-  if (l.css_shape && !l.css_code) {
-    return { ...migrated, css_code: `clip-path: ${l.css_shape}`, type: l.type || 'color', z_index: l.z_index ?? i, css_shape: undefined }
-  }
-  return { ...migrated, css_code: l.css_code || '', type: l.type || 'color', z_index: l.z_index ?? i }
-}
-
-function migrateTemplate(t: any): Template {
-  if (!t.devices || !Array.isArray(t.devices) || t.devices.length === 0) {
-    return { ...t, devices: [], preview_image: t.preview_image || '' }
-  }
-  if (typeof t.devices[0] === 'string') {
-    const oldLayers: Layer[] = Array.isArray(t.layers) ? t.layers : []
-    return {
-      ...t,
-      preview_image: t.preview_image || '',
-      devices: (t.devices as string[]).map((name: string) => ({
-        name, width: 212, height: 520, corner_radius: 48, background: '#FFFFFF',
-        layers: oldLayers.map((l, i) => migrateLayer(l, i)),
-      })),
-    }
-  }
-  return {
-    ...t,
-    preview_image: t.preview_image || '',
-    devices: t.devices.map((d: any) => ({
-      ...d,
-      width: d.width || 212, height: d.height || 520, corner_radius: d.corner_radius || 48, background: d.background || '#FFFFFF',
-      layers: Array.isArray(d.layers) ? d.layers.map((l: any, i: number) => migrateLayer(l, i)) : [],
-    })),
-  }
-}
-
-function useDeviceRecordState<T>(deviceIdx: number) {
-  const [recordsByDevice, setRecordsByDevice] = useState<Record<number, Record<number, T>>>({})
-  const current = recordsByDevice[deviceIdx] || {}
-  const setCurrent = useCallback((update: React.SetStateAction<Record<number, T>>) => {
-    setRecordsByDevice(prev => {
-      const existing = prev[deviceIdx] || {}
-      const next = typeof update === 'function'
-        ? (update as (value: Record<number, T>) => Record<number, T>)(existing)
-        : update
-      return { ...prev, [deviceIdx]: next }
-    })
-  }, [deviceIdx])
-  return [current, setCurrent] as const
-}
-
-/* ── 颜色提取 ── */
-function extractColors(img: HTMLImageElement, count = 10): string[] {
-  const canvas = document.createElement('canvas')
-  const ctx = canvas.getContext('2d')!
-  canvas.width = 128; canvas.height = 128
-  ctx.drawImage(img, 0, 0, 128, 128)
-  const data = ctx.getImageData(0, 0, 128, 128).data
-  const step = 24
-  const buckets = new Map<string, { r: number; g: number; b: number; count: number }>()
-  for (let i = 0; i < data.length; i += 4) {
-    const r = Math.round(data[i] / step) * step
-    const g = Math.round(data[i + 1] / step) * step
-    const b = Math.round(data[i + 2] / step) * step
-    const key = `${r},${g},${b}`
-    const entry = buckets.get(key)
-    if (entry) entry.count++
-    else buckets.set(key, { r, g, b, count: 1 })
-  }
-  const sorted = [...buckets.values()].sort((a, b) => b.count - a.count)
-  const diff = (a: { r: number; g: number; b: number }, b: { r: number; g: number; b: number }) =>
-    Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b)
-  const picked: typeof sorted = []
-  for (const c of sorted) {
-    if (picked.every(p => diff(p, c) >= 60)) picked.push(c)
-    if (picked.length >= count) break
-  }
-  const toHex = (n: number) => Math.min(255, n).toString(16).padStart(2, '0')
-  return picked.map(c => `#${toHex(c.r)}${toHex(c.g)}${toHex(c.b)}`)
-}
-
-function colorLuminance(color: string): number {
-  const hex = color.replace('#', '')
-  if (!/^[0-9a-f]{6}$/i.test(hex)) return 0
-  const [r, g, b] = [0, 2, 4].map(offset => Number.parseInt(hex.slice(offset, offset + 2), 16))
-  return r * 0.2126 + g * 0.7152 + b * 0.0722
-}
+import { describeScale, isHeavyUpload, prepareUserImage } from '@/lib/userImage'
+import { ArrowLeft, RotateCcw, Download, Palette, Trash2 } from 'lucide-react'
+import { RiColorFilterLine, RiDropperLine, RiImageLine } from '@remixicon/react'
+import { ProActionButton, ProActionDivider, ProAlignButton, PRO_ACTION_GAP, ProFxSlider, ProSegmented, ProSheet, proStrokeStyle, PRO_ACCENT, PRO_BUTTON_STROKE_COLOR, PRO_INK, PRO_PREVIEW_SHEET_SCALE, PRO_SHEET_DURATION, PRO_SHEET_EASING, PRO_SHEET_GAP, PRO_SHEET_TOP_RESERVE, PRO_TAB_DURATION, PRO_TAB_EASING, type AlignKind } from '@/components/ProEditorControls'
+import { DesktopAlignButton, DesktopSlider, ProPanelCard } from '@/components/ProDesktopControls'
+import { hapticTick } from '@/lib/haptics'
+import {
+  EXPORT_SCALE,
+  HANDLE_R,
+  PAD,
+  ROT_HANDLE_OFFSET,
+  ROT_HANDLE_R,
+  applySvgColor,
+  getClipPath,
+  getLayerBoxStyle,
+  getLayerCss,
+  applyPickedColorToBoxStyle,
+  composeLayerFlipTransform,
+  fitSvgToContainer,
+  getRoundedClipPath,
+  parseBoxShadow,
+  parseBorderRadius,
+  parseClipPathToPoints,
+  pointsToSvgAttr,
+  fillClipPath,
+  parseCssBlock,
+  getRawCssProps,
+  resolveBorderRadius,
+  resolveBoxPaintPolicy,
+  resolveGroupAnchors,
+  resolveImageDrawRect,
+  resolveImageFilterForExport,
+  resolveLayerPreviewTransform,
+  resolveLayerRect,
+  resolveLayerContentRect,
+  resolveBackdropBlurPx,
+  svgShapeMaskDataUri,
+  svgToDataUri,
+  drawSoftwareFilteredImage,
+  createBlurredRegion,
+  resolveTextStyleWithOverride,
+  resolveUserImageFit,
+  shouldUseProEditor,
+  shrinkToHalfLimit,
+  snapRotation,
+  cssToProps,
+  createCanvasLinearGradient,
+  recolorLinearGradient,
+  resolveBlurMax,
+  useDeviceRecordState,
+  useTemplateFonts,
+  migrateTemplate,
+  type DragMode,
+  type DeviceConfig,
+  type HorizontalTextAlign,
+  type Layer,
+  type LayerState,
+  type Template,
+  type TextAlignOverride,
+  type UserImageFx,
+  type VerticalTextAlign,
+} from '@/lib/watchFaceKit'
 
 /* ═══════════════════════════════════════════════════════════
    主组件
    ═══════════════════════════════════════════════════════════ */
+
+/** 两种底部抽屉的设计高度（= ProSheet 的 minHeight）。
+ *  展开动画的目标高度必须「第一帧就是对的」：先用别的抽屉量到的高度算位移、
+ *  等挂载量到真实高度再改回来，预览框和抽屉都会走两段（先冲过头再退回来）。 */
+const PRO_SHEET_MIN_HEIGHT: Record<'fx' | 'color', number> = { fx: 357, color: 217 }
+
+/** 新版移动端编辑器的页面底色。与全站一致（index.html 兜底底色、原生状态栏都是白色），
+ *  同时会被写到 html/body 上，避免下拉回弹时露出另一层颜色。 */
+const PRO_PAGE_BG = '#ffffff'
+/** 白色页面上的次级文字（模板名以外的说明文字、未选中的设备名等） */
+const PRO_DIM_INK = 'rgba(19, 19, 19, 0.6)'
+/** 白色页面上的细描边：预览框外框、设备切换胶囊 */
+const PRO_HAIRLINE = 'rgba(0, 0, 0, 0.12)'
+/** 移动端「点一下图片」的判定：落点到松手的位移不超过 10px，且按住不超过 600ms 才算点击。
+ *  松手时位移超过这个值就只当手势（平移 / 缩放），不再当成点击。 */
+const TAP_SLOP = 10
+const TAP_HOLD_MS = 600
+/** 触摸之后浏览器还会补发一整套 mousedown/mouseup/click（React 给 touchstart 挂的是 passive 监听，
+ *  preventDefault 拦不住它）。这段时间内的鼠标事件要当成「同一次触摸」，不能再算一次鼠标点击，
+ *  否则手机上点一下：touchend 先放大，紧接着补发的 mouseup 又把它收回去。 */
+const TOUCH_MOUSE_GUARD_MS = 700
 
 export function TemplateEditor() {
   const { id } = useParams<{ id: string }>()
@@ -765,7 +116,13 @@ export function TemplateEditor() {
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
   const [dragStartState, setDragStartState] = useState({ x: 0, y: 0, scale: 1, rotation: 0 })
   const [activeLayerIdx, setActiveLayerIdx] = useState<number | null>(null)
-  const groupDragRef = useRef<{ gid: string; members: { realIdx: number; startX: number; startY: number }[] } | null>(null)
+  /** 「同图」组内其他图层的起始状态（位移 / 缩放 / 旋转）。
+   *  底层用户点不到，顶层做任何变换时都得按同一增量带着它们走，
+   *  否则磨砂背景会和上层图片越差越远，而用户没有任何办法把它们对回去。 */
+  const groupDragRef = useRef<{
+    gid: string
+    members: { realIdx: number; startX: number; startY: number; startScale: number; startRotation: number }[]
+  } | null>(null)
   const [isDragOver, setIsDragOver] = useState(false)
   const [msg, setMsg] = useState('')
   const [exporting, setExporting] = useState(false)
@@ -779,21 +136,156 @@ export function TemplateEditor() {
       && (CSS.supports('backdrop-filter', 'blur(1px)') || CSS.supports('-webkit-backdrop-filter', 'blur(1px)'))
     setBackdropFilterOk(!isAndroidRuntime && supportsBackdrop)
   }, [])
+
+  /* ── 整页底色与下拉回弹（只在新版移动端界面上做）──
+     页面底色与全站一致是白色，但移动端手指往上拉时页面会回弹，露出来的是 html/body 那一层。
+     这里把文档底色也设成同色，再关掉下拉刷新（否则在抽屉顶部往下拖会变成刷新页面）。
+     旧版界面走的是主题色，所以只在走 Pro 界面时改，退出时原样还原。 */
+  useEffect(() => {
+    if (!shouldUseProEditor(template)) return
+    const root = document.documentElement
+    const body = document.body
+    const prev = {
+      rootBg: root.style.background,
+      bodyBg: body.style.background,
+      rootOverscroll: root.style.overscrollBehaviorY,
+      bodyOverscroll: body.style.overscrollBehaviorY,
+    }
+    root.style.background = PRO_PAGE_BG
+    body.style.background = PRO_PAGE_BG
+    root.style.overscrollBehaviorY = 'none'
+    body.style.overscrollBehaviorY = 'none'
+    return () => {
+      root.style.background = prev.rootBg
+      body.style.background = prev.bodyBg
+      root.style.overscrollBehaviorY = prev.rootOverscroll
+      body.style.overscrollBehaviorY = prev.bodyOverscroll
+    }
+  }, [template])
   // 文字编辑
   const [editingTextIdx, setEditingTextIdx] = useState<number | null>(null)
   const [editedTexts, setEditedTexts] = useDeviceRecordState<string>(selectedDeviceIdx)
+
+  /* ── 新版移动端编辑器（手环 Pro 系列）专属状态 ── */
+  // 用户在「效果-图片效果」里新调的滤镜；旧模板没有这份数据，全部按中性值处理。
+  const [imageFx, setImageFx] = useState<UserImageFx>({})
+  // 用户在「效果-文字编辑」里手选的排版；只作用于本次编辑，不写回模板数据。
+  const [textAlignOverrides, setTextAlignOverrides] = useDeviceRecordState<TextAlignOverride>(selectedDeviceIdx)
+  // 当前展开的底部抽屉：'fx' 效果 / 'color' 取色 / null 收起
+  const [activeSheet, setActiveSheet] = useState<'fx' | 'color' | null>(null)
+  const [fxTab, setFxTab] = useState<'image' | 'text'>('image')
+  // 「签名」标签下正在编辑的文字图层
+  const [alignTextIdx, setAlignTextIdx] = useState<number | null>(null)
+  // 「排版」是单选：只记录当前高亮的那一个按钮，避免水平和垂直方向同时亮起两块
+  const [alignKind, setAlignKind] = useState<AlignKind | null>(null)
+  // 底部区域的展开动画：抽屉 / 入口按钮各自的自然高度，以及收起后仍要挂载的抽屉内容
+  const [sheetKind, setSheetKind] = useState<'fx' | 'color' | null>(null)
+  // 每个抽屉各记一份实测高度，未测到之前先用设计高度兜底（见 PRO_SHEET_MIN_HEIGHT 注释）
+  const [sheetHeights, setSheetHeights] = useState({ ...PRO_SHEET_MIN_HEIGHT })
+  const [actionBarHeight, setActionBarHeight] = useState(0)
+  // 全屏预览：点一下预览框里的图片就把整块放大到屏幕内能放下的最大尺寸，再点一下收回
+  const [previewExpanded, setPreviewExpanded] = useState(false)
+  /** 放大前预览框在屏幕上的中心。放大后要把它挪到屏幕正中，
+   *  所以用 transform-origin 缩放之外还要补一段位移；这个中心只能在「收起状态」量，
+   *  量一次存下来，收回去时才能沿原路回到原位。 */
+  const [previewOrigin, setPreviewOrigin] = useState<{ x: number; y: number } | null>(null)
+  const sheetBoxRef = useRef<HTMLDivElement | null>(null)
+  const actionBarRef = useRef<HTMLDivElement | null>(null)
+  /** 预览框外层（承载全屏缩放的那一层） */
+  const previewBoxRef = useRef<HTMLDivElement | null>(null)
+  /** 单指按下时记下的落点，松手时用它判断这次触摸算不算一次「点击」 */
+  const tapRef = useRef<{ x: number; y: number; t: number } | null>(null)
+  /** 鼠标按下时的落点，以及这次按下有没有拖动过：没拖动 = 一次「点击图片」，用来放大 / 收回预览框 */
+  const mouseTapRef = useRef<{ x: number; y: number } | null>(null)
+  const mouseTapMovedRef = useRef(false)
+  /** 最近一次触摸的时间，用来把触摸后补发的那套鼠标事件（见 TOUCH_MOUSE_GUARD_MS）排除在「鼠标点击」之外 */
+  const lastTouchAtRef = useRef(0)
+  /** 点击已经切换过全屏预览时，抑制紧随其后的 click（否则又会把图层取消选中，白点一下） */
+  const suppressPreviewClickRef = useRef(false)
+
+  /* ── 点一下预览框里的图片 → 把预览框放大到铺满屏幕（再点一下收回） ──
+     触摸那一路的判定放在 touchend 而不是靠浏览器的 click：单指触摸在 handleTouchStart 里
+     preventDefault 过，浏览器不会补发 click；自己判定还能顺手把双指手势排除掉
+     （双指落下时 tapRef 被清空）。鼠标那一路见 handleMouseDown 里的落点记录。
+     必须放在下面几个 effect 之前：effect 的依赖数组是立即求值的，声明在后面会触发 TDZ 报错。 */
+  const togglePreviewExpanded = useCallback(() => {
+    if (previewExpanded) { setPreviewExpanded(false); return }
+    // 放大前先量一次预览框在屏幕上的中心：放大后要把它挪到屏幕正中，
+    // 只有收起状态下量到的才是「原位」，收回去时才能沿原路退回。
+    const el = previewBoxRef.current
+    if (el) {
+      const rect = el.getBoundingClientRect()
+      setPreviewOrigin({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
+    }
+    setPreviewExpanded(true)
+  }, [previewExpanded])
+
+  /** 抽屉当前要显示的内容：展开时跟着 activeSheet，收起后保留最后一次的种类（收起动画还要靠它）。
+   *  默认 'fx'：抽屉始终挂载，第一次展开才有「上一帧位置」可以过渡，否则首帧直接跳到位、看不到动画。
+   *  必须放在下面几个 effect 之前：effect 的依赖数组是立即求值的，声明在后面会触发 TDZ 报错。 */
+  const sheetKindForLayout = activeSheet ?? sheetKind ?? 'fx'
+
+  /** 新版移动端编辑器目前只覆盖手环 Pro 系列，其余机型继续走旧版界面，存量模板体验不变。
+   *  必须放在下面几个 effect 之前：effect 的依赖数组是立即求值的，声明在后面会触发 TDZ 报错。 */
+  const isProUi = shouldUseProEditor(template)
+
+  /** 窗口尺寸：移动端 / 桌面端断点用。声明在这里是因为下面的 effect 依赖它算出的 isProDesktop，
+   *  依赖数组是立即求值的，声明在后面会触发 TDZ 报错。 */
+  const [winSize, setWinSize] = useState({ w: typeof window !== 'undefined' ? window.innerWidth : 375, h: typeof window !== 'undefined' ? window.innerHeight : 667 })
+  /** 桌面端走「左侧预览 + 右侧数据栏」那套 Pro 版式；移动端继续用底部抽屉。 */
+  const isProDesktop = isProUi && winSize.w >= 1024
+
+  // 抽屉收起后内容不卸载：收起动画期间还要靠它滑动，卸载了就只剩底部瞬间上跳
+  useEffect(() => { if (activeSheet) setSheetKind(activeSheet) }, [activeSheet])
+
+  // 底部区域的高度不能写死：抽屉内容随标签、安全区变化，入口按钮的高度也由内容决定。
+  // 抽屉高度实测（按抽屉种类分别记录），入口按钮的高度交给 ResizeObserver。
+  // 依赖里带 isProDesktop：桌面端不渲染抽屉（ref 为 null），从桌面缩回移动端时
+  // 抽屉与入口栏是新挂载的节点，不重新量就会一直用兜底高度。
+  useEffect(() => {
+    const el = sheetBoxRef.current
+    if (!el) return
+    const kind = sheetKindForLayout
+    const measure = () => {
+      const h = Math.round(el.offsetHeight)
+      setSheetHeights(prev => (prev[kind] === h ? prev : { ...prev, [kind]: h }))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [sheetKindForLayout, isProDesktop])
+
+  useEffect(() => {
+    const el = actionBarRef.current
+    if (!el) return
+    const measure = () => setActionBarHeight(Math.round(el.offsetHeight))
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [isProUi, isProDesktop])
 
   useEffect(() => {
     setActiveLayerIdx(null)
     setEditingTextIdx(null)
     setDragMode(null)
+    setActiveSheet(null)
+    setAlignTextIdx(null)
+    setAlignKind(null)
   }, [selectedDeviceIdx])
+
+  // 提示条到点自动消失：否则「图片已开始下载」这类结果会一直挂在底部，遮住抽屉内容。
+  useEffect(() => {
+    if (!msg) return
+    const timer = window.setTimeout(() => setMsg(''), 3000)
+    return () => window.clearTimeout(timer)
+  }, [msg])
 
   const fileInputRefs = useRef<Record<number, HTMLInputElement | null>>({})
   const containerRef = useRef<HTMLDivElement>(null)
   const previewWrapRef = useRef<HTMLDivElement>(null)
   const [wrapSize, setWrapSize] = useState({ w: typeof window !== 'undefined' ? window.innerWidth - 80 : 300, h: typeof window !== 'undefined' ? window.innerHeight - 260 : 400 })
-  const [winSize, setWinSize] = useState({ w: typeof window !== 'undefined' ? window.innerWidth : 375, h: typeof window !== 'undefined' ? window.innerHeight : 667 })
 
   // 加载模板（离线：读打包进 APK 的 template.json）
   useEffect(() => {
@@ -815,60 +307,8 @@ export function TemplateEditor() {
       .catch((e: any) => { setError(e.message || '加载失败'); setLoading(false) })
   }, [id])
 
-  // 加载文字图层所用字体到浏览器（FontFace API）
-  useEffect(() => {
-    if (!template) return
-    const families = new Set<string>()
-    for (const dev of template.devices) {
-      for (const layer of dev.layers) {
-        if (layer.type === 'text') {
-          const family = resolveTextStyle(layer, dev.width, dev.height).fontFamily
-          if (family) families.add(family)
-        }
-      }
-    }
-    if (families.size === 0) return
-
-    const loadFonts = async (fonts: any[]) => {
-      const loads: Promise<FontFace>[] = []
-      for (const f of fonts) {
-        const name = f.family_name || f.original_name
-        if (!families.has(name)) continue
-        const rawUrl = f.url || (f.filename ? offlineAsset(`assets/${f.filename}`) : '')
-        if (!rawUrl) continue
-        const source = /^https?:\/\//i.test(rawUrl) || rawUrl.startsWith('./') || rawUrl.startsWith('data:')
-          ? rawUrl
-          : `${API_BASE}${rawUrl}`
-        const ff = new FontFace(name, `url("${source}")`, {
-          style: normalizeFontFaceStyle(f.style),
-          weight: f.is_variable ? '100 900' : String(f.weight || 400),
-        })
-        loads.push(
-          ff.load().then(font => {
-            document.fonts.add(font)
-            return font
-          }).catch((err) => {
-            console.error(`[font] 加载失败: ${name} (${source})`, err)
-            throw err
-          })
-        )
-      }
-      if (loads.length > 0) {
-        await Promise.allSettled(loads)
-        await document.fonts.ready
-      }
-    }
-
-    if (IS_OFFLINE) {
-      fetch(offlineAsset('fonts.json'))
-        .then((r) => (r.ok ? r.json() : []))
-        .then(loadFonts)
-        .catch(() => {})
-      return
-    }
-
-    apiFetch('/api/fonts').then(loadFonts).catch(() => {})
-  }, [template])
+  // 加载文字图层所用字体到浏览器（FontFace API），与新版编辑器共用同一实现
+  useTemplateFonts(template)
 
   // 窗口尺寸
   useEffect(() => {
@@ -878,21 +318,31 @@ export function TemplateEditor() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  // 预览区域测量
+  // 预览区域测量（新旧两套布局、以及 Pro 的桌面/移动两套版式的预览容器都不同，切换时重新挂观察器）
   useEffect(() => {
     const el = previewWrapRef.current
     if (!el) return
     const measure = () => {
+      // 元素已经从文档里摘掉时，getComputedStyle 的 padding 会返回空串，parseFloat 得到 NaN。
+      // 这种「过期」的测量（切版式或热更新时 ResizeObserver 的滞后回调）绝不能写进状态：
+      // 一旦 wrapSize 变成 NaN，预览整体缩放 previewScale 就是 NaN，
+      // 手柄的绝对定位和拖拽的位移换算全跟着废掉（表现为手柄挤在左上角、图片拖不动）。
+      if (!el.isConnected) return
       const cs = getComputedStyle(el)
       const padW = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)
       const padH = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom)
-      setWrapSize({ w: Math.floor(el.clientWidth - padW), h: Math.floor(el.clientHeight - padH) })
+      if (!Number.isFinite(padW) || !Number.isFinite(padH)) return
+      const w = el.clientWidth - padW
+      const h = el.clientHeight - padH
+      // 折叠或尚未布局时量到 0，不能拿它当可用尺寸（会把预览缩到看不见）
+      if (!(w > 0) || !(h > 0)) return
+      setWrapSize({ w: Math.floor(w), h: Math.floor(h) })
     }
     measure()
     const ro = new ResizeObserver(measure)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [isProUi, isProDesktop, selectedDeviceIdx])
 
   const device = template?.devices[selectedDeviceIdx]
   const sortedLayers = useMemo(() => {
@@ -913,7 +363,8 @@ export function TemplateEditor() {
     if (!device) return []
     return device.layers
       .map((layer, realIdx) => ({ layer, realIdx }))
-      .filter(({ layer }) => layer.color_mode === 'picker' && layer.type !== 'image' && layer.type !== 'text')
+      .filter(({ layer }) =>
+        (layer.color_mode === 'picker' || layer.text_stroke_color_mode === 'picker') && layer.type !== 'image')
   }, [device])
 
   const textLayers = useMemo(() => {
@@ -923,13 +374,42 @@ export function TemplateEditor() {
       .filter(({ layer }) => layer.type === 'text')
   }, [device])
 
-  // 预览缩放
+  /** 已上传图片的交互图层下标：图片效果抽屉里的滤镜作用在这些图层上 */
+  const uploadedImageIndexes = useMemo(
+    () => interactiveLayers.filter(({ realIdx }) => layerStates[realIdx]?.imageUrl).map(({ realIdx }) => realIdx),
+    [interactiveLayers, layerStates],
+  )
+  /** 预览用：把用户新调的滤镜挂到每个已上传图片的图层上（中性值时 kit 会自动忽略） */
+  const imageFxByLayer = useMemo(
+    () => Object.fromEntries(uploadedImageIndexes.map(i => [i, imageFx])) as Record<number, UserImageFx>,
+    [uploadedImageIndexes, imageFx],
+  )
+
+  // 桌面端数据栏里的「签名」是常驻面板，需要一个默认的编辑对象：
+  // 只有一个文字图层时面板里没有可点的图层胶囊，不自动选中就没有输入框可用。
+  // 移动端不走这条（抽屉是靠点预览里的文字打开的）。
+  useEffect(() => {
+    if (!isProDesktop) return
+    if (alignTextIdx != null && textLayers.some(({ realIdx }) => realIdx === alignTextIdx)) return
+    setAlignTextIdx(textLayers[0]?.realIdx ?? null)
+  }, [isProDesktop, textLayers, alignTextIdx])
+
+  /* ── 新版布局：预览区与预览缩放 ── */
   const isMobile = winSize.w < 1024
-  const rawAvailW = isMobile ? Math.max(160, winSize.w - 72) : Math.max(200, (winSize.w - 136) * 2 / 3)
-  const rawAvailH = isMobile ? Math.max(200, winSize.h - 220) : Math.max(200, winSize.h - 200)
-  const maxAvailW = wrapSize.w > 0 ? Math.min(rawAvailW, wrapSize.w - PAD * 2) : rawAvailW
-  const maxAvailH = wrapSize.h > 0 ? Math.min(rawAvailH, wrapSize.h - PAD * 2) : rawAvailH
-  const previewScale = device ? Math.min(maxAvailW / device.width, maxAvailH / device.height, 1) : 1
+  // 抽屉展开后预览区被压缩，wrapSize 由 ResizeObserver 实时测量，预览自动缩小让位。
+  // Pro 版预览容器四周还要留出 PAD 的把手/描边空间，可用尺寸先扣掉这部分：
+  // 否则容器会比可用宽度宽，溢出后容器自己贴着左边（表现为「预览框不居中」）。
+  const rawAvailW = isProUi
+    ? Math.max(120, wrapSize.w - PAD * 2)
+    : isMobile ? Math.max(160, winSize.w - 72) : Math.max(200, (winSize.w - 136) * 2 / 3)
+  const rawAvailH = isProUi
+    ? Math.max(120, wrapSize.h - PAD * 2)
+    : isMobile ? Math.max(200, winSize.h - 220) : Math.max(200, winSize.h - 200)
+  const maxAvailW = isProUi ? rawAvailW : (wrapSize.w > 0 ? Math.min(rawAvailW, wrapSize.w - PAD * 2) : rawAvailW)
+  const maxAvailH = isProUi ? rawAvailH : (wrapSize.h > 0 ? Math.min(rawAvailH, wrapSize.h - PAD * 2) : rawAvailH)
+  const previewScaleRaw = device ? Math.min(maxAvailW / device.width, maxAvailH / device.height, 1) : 1
+  /** 兜底：可用尺寸若因为未布局/测量异常变成 NaN，也不能让整块预览的几何全变 NaN */
+  const previewScale = Number.isFinite(previewScaleRaw) && previewScaleRaw > 0 ? previewScaleRaw : 1
   const previewWidth = device ? device.width * previewScale : 0
   const previewHeight = device ? device.height * previewScale : 0
   const cornerRadius = device ? device.corner_radius * previewScale : 0
@@ -937,6 +417,50 @@ export function TemplateEditor() {
   const containerHeight = previewHeight + PAD * 2
   const vpLeft = (containerWidth - previewWidth) / 2
   const vpTop = (containerHeight - previewHeight) / 2
+
+  /* ── 抽屉展开时预览框整块上移并缩小 ──
+     位置：设计稿里展开抽屉后预览框落在「抽屉顶边以上的可视区域」里居中，而不是固定贴着抽屉顶边：
+     抽屉 357 高时预览框底边离抽屉 27px，抽屉 217 高时离 95px —— 抽屉每矮 2px、间隙就多 1px。
+     所以这里按居中算，再兜一个 PRO_SHEET_GAP 的最小间隙，避免抽屉很高时预览框压到抽屉上。
+     尺寸：展开时整体缩到 PRO_PREVIEW_SHEET_SCALE，做出 iOS「内容往后退一层」的层次感。
+     尺寸和位移一起走 transform 过渡，和抽屉上滑同一时长、同一曲线。 */
+  const previewDistFromBottom = actionBarHeight + PAD + (wrapSize.h - previewHeight) / 2
+  const sheetHeight = sheetHeights[sheetKindForLayout]
+  const previewTopY = winSize.h - previewDistFromBottom - previewHeight
+  const sheetTopY = winSize.h - sheetHeight
+  /** 展开时的缩放比例（收起恒为 1）。桌面端不做抽屉（activeSheet 恒为 null），
+   *  从移动端版式切过来时也不认残留值，免得拖拽换算被这层缩放带偏。 */
+  const previewSheetScale = activeSheet && !isProDesktop ? PRO_PREVIEW_SHEET_SCALE : 1
+  /** 缩小后的实际高度：位移必须按缩完的尺寸算，否则底边会离抽屉忽远忽近 */
+  const scaledPreviewHeight = previewHeight * previewSheetScale
+  /** 居中后的预览框顶边；「底边至少离抽屉 PRO_SHEET_GAP」对应的顶边；取更靠上的那个 */
+  const previewTargetTopY = Math.min(
+    PRO_SHEET_TOP_RESERVE + (sheetTopY - PRO_SHEET_TOP_RESERVE - scaledPreviewHeight) / 2,
+    sheetTopY - PRO_SHEET_GAP - scaledPreviewHeight,
+  )
+  // transform-origin 是中心，所以位移 = 原中心 - 目标中心
+  const previewShiftY = activeSheet
+    ? Math.max(0, Math.round(previewTopY + previewHeight / 2 - previewTargetTopY - scaledPreviewHeight / 2))
+    : 0
+
+  /* ── 全屏预览：点一下图片把预览框放大到铺满屏幕 ──
+     放大到「屏幕内放得下的最大尺寸」而不是按高度铺满：
+     表盘是竖长比例（宽约为高的 0.7），按高度铺满会把左右两侧裁掉，
+     编辑时正好看不到表盘的左右边缘，反而更不好对齐。
+     缩放与位移都只走 transform，和抽屉那套动画同一个时长、同一条曲线，
+     所以进出都是「从原位长出去、再缩回原位」，而不是闪一下换个尺寸。 */
+  const FULLSCREEN_MARGIN = 16
+  /** 当前外层已经施加的总缩放（抽屉缩放 × 全屏缩放）：指针位移换算成设备像素时要一起除掉。
+   *  桌面端这两层都不存在，恒为 1。 */
+  const previewExpandScale = previewExpanded && !isProDesktop && previewWidth > 0
+    ? Math.min(
+        (winSize.w - FULLSCREEN_MARGIN * 2) / (previewWidth * previewSheetScale),
+        (winSize.h - FULLSCREEN_MARGIN * 2) / (previewHeight * previewSheetScale),
+      )
+    : 1
+  const previewRenderScale = previewSheetScale * previewExpandScale
+  const previewExpandShiftX = previewExpanded && previewOrigin ? winSize.w / 2 - previewOrigin.x : 0
+  const previewExpandShiftY = previewExpanded && previewOrigin ? winSize.h / 2 - previewOrigin.y : 0
 
   /* ── 计算图片在模板框内的初始显示尺寸（设备坐标系，预览与导出共用） ── */
   const getImageDisplay = useCallback((layerIdx: number): { dw: number; dh: number; frameW: number; frameH: number; baseX: number; baseY: number } | null => {
@@ -985,92 +509,201 @@ export function TemplateEditor() {
     return indexes.length > 0 ? indexes : [layerIdx]
   }, [device, interactiveLayers])
 
-  /* ── 文件上传（同组图层共享同一张图片） ── */
-  const handleFileUpload = useCallback((layerIdx: number, file: File) => {
-    if (!file.type.startsWith('image/')) return
-    const url = URL.createObjectURL(file)
-    const img = new Image()
-    img.onload = () => {
-      const siblingIdxs = getSharedUploadLayerIndexes(layerIdx)
-      const replacedUrls = new Set(
-        siblingIdxs
-          .map(idx => layerStatesRef.current[idx]?.imageUrl)
-          .filter((oldUrl): oldUrl is string => Boolean(oldUrl && oldUrl !== url)),
-      )
-
-      setLayerStates(prev => {
-        const next = { ...prev }
-        for (const idx of siblingIdxs) {
-          const adj = device?.layers[idx]?.adjustments
-          next[idx] = {
-            imageUrl: url,
-            naturalWidth: img.naturalWidth,
-            naturalHeight: img.naturalHeight,
-            position: prev[idx]?.position ?? { x: 0, y: 0 },
-            scale: adj?.scale ?? 1,
-            rotation: adj?.rotation ?? 0,
-          }
+  /** 记录同组（共用一张用户图）其他图层的起始状态，供整组联动使用。
+   *  在拖拽/缩放/旋转开始时调一次；未成组或组里只有自己时，groupDragRef 保持为 null。 */
+  const captureGroupMembers = useCallback((layerIdx: number) => {
+    groupDragRef.current = null
+    const layer = device?.layers[layerIdx]
+    const gid = layer?.group_id?.trim()
+    if (!layer || !gid) return
+    const members = device!.layers
+      .map((l, i) => ({ l, i }))
+      .filter(({ l, i }) => i !== layerIdx && l.allow_user_upload && l.group_id?.trim() === gid)
+      .map(({ i }) => {
+        const s = layerStatesRef.current[i]
+        return {
+          realIdx: i,
+          startX: s?.position.x ?? 0,
+          startY: s?.position.y ?? 0,
+          startScale: s?.scale ?? 1,
+          startRotation: s?.rotation ?? 0,
         }
-        return next
       })
-      replacedUrls.forEach(oldUrl => URL.revokeObjectURL(oldUrl))
-      const colors = extractColors(img)
-      if (colors.length > 0) {
-        setPickerColors(prev => ({
-          ...prev,
-          ...Object.fromEntries(pickerColorLayers.map(({ realIdx }) => [realIdx, colors])),
-        }))
-        // 所有 picker 图层统一默认色：以第一个 picker 图层的偏好为准
-        const sortedByLuminance = [...colors].sort((a, b) => colorLuminance(a) - colorLuminance(b))
-        const firstPicker = pickerColorLayers[0]
-        const preferred = firstPicker?.layer.picker_default === 'light'
-          ? sortedByLuminance[sortedByLuminance.length - 1]
-          : sortedByLuminance[0]
-        setPickedColor(prev => ({
-          ...prev,
-          ...Object.fromEntries(pickerColorLayers.map(({ realIdx }) => [realIdx, preferred])),
-        }))
+    if (members.length > 0) groupDragRef.current = { gid, members }
+  }, [device])
+
+  /** 把本次手势的增量同步到同组其他图层。增量都是相对「手势开始时的状态」，
+   *  所以位移/缩放/旋转可以同时写，没参与这次手势的那几项自然保持原值。 */
+  const syncGroupMembers = (
+    prev: Record<number, LayerState>,
+    delta: { dx?: number; dy?: number; scaleFactor?: number; rotationDelta?: number },
+  ): Record<number, LayerState> => {
+    const group = groupDragRef.current
+    if (!group) return prev
+    const { dx = 0, dy = 0, scaleFactor = 1, rotationDelta = 0 } = delta
+    const next = { ...prev }
+    for (const m of group.members) {
+      const s = prev[m.realIdx]
+      if (!s) continue
+      next[m.realIdx] = {
+        ...s,
+        position: { x: m.startX + dx, y: m.startY + dy },
+        scale: Math.max(0.1, Math.min(5, m.startScale * scaleFactor)),
+        rotation: m.startRotation + rotationDelta,
       }
     }
-    img.src = url
-    setActiveLayerIdx(layerIdx)
+    return next
+  }
+
+  /* ── 文件上传（同组图层共享同一张图片） ── */
+  /** 每次上传占一个序号：连着选两张时只认最后一次的结果。
+   *  大图解码压缩要几百毫秒，先选的那张后返回就会把刚选的盖掉。 */
+  const uploadSeqRef = useRef(0)
+  /** 大图正在解码/压缩：给用户一个交代，也顺便挡住重复点击的错觉 */
+  const [preparingImage, setPreparingImage] = useState(false)
+
+  const handleFileUpload = useCallback((layerIdx: number, file: File) => {
+    if (!file.type.startsWith('image/')) return
+    // 选中「同图」组里最上面那层：底层不接受操作，把手/滚轮/效果都该落在顶层上，
+    // 否则从底层的文件输入上传时会把激活图层停在底层。
+    setActiveLayerIdx(resolveGroupAnchors(device?.layers ?? []).get(layerIdx) ?? layerIdx)
+
+    const seq = ++uploadSeqRef.current
+    // 小图几十毫秒就处理完，弹一句「正在处理」反而像闪屏；只有大图才提示
+    setPreparingImage(isHeavyUpload(file))
+
+    // 交给 userImage 归一化：解码时直接缩到上限内、把 HDR/广色域描述烧进 sRGB 像素再重编码，
+    // 免得几亿像素的原图把页面卡死，也免得预览和导出因为色彩描述不一致而发灰。
+    prepareUserImage(file)
+      .then(prepared => {
+        if (seq !== uploadSeqRef.current) {
+          URL.revokeObjectURL(prepared.url)
+          return
+        }
+        const url = prepared.url
+        const img = prepared.image
+        const siblingIdxs = getSharedUploadLayerIndexes(layerIdx)
+        const replacedUrls = new Set(
+          siblingIdxs
+            .map(idx => layerStatesRef.current[idx]?.imageUrl)
+            .filter((oldUrl): oldUrl is string => Boolean(oldUrl && oldUrl !== url)),
+        )
+
+        setLayerStates(prev => {
+          const next = { ...prev }
+          for (const idx of siblingIdxs) {
+            const adj = device?.layers[idx]?.adjustments
+            next[idx] = {
+              imageUrl: url,
+              naturalWidth: img.naturalWidth,
+              naturalHeight: img.naturalHeight,
+              position: prev[idx]?.position ?? { x: 0, y: 0 },
+              scale: adj?.scale ?? 1,
+              rotation: adj?.rotation ?? 0,
+            }
+          }
+          return next
+        })
+        replacedUrls.forEach(oldUrl => URL.revokeObjectURL(oldUrl))
+        const colors = extractImageColors(img)
+        if (colors.length > 0) {
+          setPickerColors(prev => ({
+            ...prev,
+            ...Object.fromEntries(pickerColorLayers.map(({ realIdx }) => [realIdx, colors])),
+          }))
+          const firstPicker = pickerColorLayers[0]
+          const preferred = selectPaletteColor(colors,
+            (firstPicker?.layer.color_mode === 'picker' && firstPicker.layer.picker_default)
+            || (firstPicker?.layer.text_stroke_color_mode === 'picker' && firstPicker.layer.text_stroke_picker_default)
+            || 'dark')
+          setPickedColor(prev => ({
+            ...prev,
+            ...Object.fromEntries(pickerColorLayers.map(({ realIdx }) => [realIdx, preferred])),
+          }))
+        }
+        // 压缩过就说一声：用户看到的是「图变糊了一点」，得知道为什么
+        if (prepared.resized) setMsg(`图片过大，已压缩：${describeScale(prepared)}`)
+      })
+      .catch((error: unknown) => {
+        if (seq !== uploadSeqRef.current) return
+        setMsg(error instanceof Error ? error.message : '图片处理失败，请换一张再试')
+      })
+      .finally(() => {
+        if (seq === uploadSeqRef.current) setPreparingImage(false)
+      })
   }, [pickerColorLayers, device, getSharedUploadLayerIndexes])
 
   /* ── 拖拽/缩放/旋转 ── */
+  /** 按下时同步挂一个一次性的 mouseup 给这次拖动收尾。
+   *
+   *  不能只靠下面 effect 里那对 window 监听：effect 要等 React 提交完才挂上，
+   *  按得很快的一次点击（脚本化点击、触控板轻点）会在它挂上之前就松手，
+   *  那次 mouseup 就永远收不到，dragMode 一直停在 'move'，
+   *  之后不按鼠标移动光标图片也会跟着走。这里在 mousedown 里当场挂上，时序上不可能漏。
+   *  正常松手时它会和 effect 里那个监听一起触发，两次 setDragMode(null) 是幂等的。 */
+  const armDragEnd = useCallback(() => {
+    window.addEventListener('mouseup', () => {
+      groupDragRef.current = null
+      setDragMode(null)
+    }, { once: true })
+  }, [])
+
   const handleMouseDown = useCallback((layerIdx: number, e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
     const state = layerStatesRef.current[layerIdx]
     if (!state) return
+    // 刚触摸过：这一整套鼠标事件都是触摸补发出来的（React 给 touchstart 挂的是 passive 监听，
+    // preventDefault 拦不住），里面既有 mouseup 也有拖动过程中的 mousemove。
+    // 照单全收的话，手机上「点一下」会变成刚放大又立刻收回，单指拖动也会把图片拖走
+    // —— Pro 界面只认双指，所以整段丢掉。
+    if (isProUi && performance.now() - lastTouchAtRef.current <= TOUCH_MOUSE_GUARD_MS) return
+    // Pro 界面（移动端）：记下落点。松手时若指针没挪动过（< TAP_SLOP），这次按下算「点击图片」，
+    // 由下面常驻的 mouseup 监听切换全屏预览 —— 拖动调图不会误触发。
+    // 桌面端不走这套：预览框不提供全屏放大，点击只是选中图层。
+    if (isProUi && !isProDesktop) {
+      mouseTapRef.current = { x: e.clientX, y: e.clientY }
+      mouseTapMovedRef.current = false
+    }
+    armDragEnd()
     setDragMode('move')
     setDragStart({ x: e.clientX, y: e.clientY })
     setDragStartState({ x: state.position.x, y: state.position.y, scale: state.scale, rotation: state.rotation })
     setActiveLayerIdx(layerIdx)
-    // 成组联动：记录同组其他交互图层初始位置
-    groupDragRef.current = null
-    if (device) {
-      const layer = device.layers[layerIdx]
-      if (layer?.group_id) {
-        const members = device.layers
-          .map((l, i) => ({ l, i }))
-          .filter(({ l, i }) => l.group_id === layer.group_id && l.allow_user_upload && i !== layerIdx)
-          .map(({ i }) => {
-            const s = layerStatesRef.current[i]
-            return { realIdx: i, startX: s?.position.x ?? 0, startY: s?.position.y ?? 0 }
-          })
-        if (members.length > 0) groupDragRef.current = { gid: layer.group_id, members }
-      }
-    }
-  }, [device])
+    // 成组联动：记录同组其他交互图层初始状态
+    captureGroupMembers(layerIdx)
+  }, [isProUi, isProDesktop, armDragEnd, captureGroupMembers])
 
   const handleTouchStart = useCallback((layerIdx: number, e: React.TouchEvent) => {
     e.stopPropagation()
     e.preventDefault()
+    // 触摸开始了：之后跟来的那套补发鼠标事件都不算「鼠标点击」
+    lastTouchAtRef.current = performance.now()
     const state = layerStatesRef.current[layerIdx]
     if (!state) return
+    // Pro 界面（仅移动端版式）单指：
+    //  · 预览框没有全屏放大时不动图片，只记下落点，拖动留给双指；
+    //  · 全屏放大后允许单指平移 —— 放大时看的是细节，双指反而挡视线、不好对位。
+    // 两种情况都保留 tapRef：松手时没挪动过（< TAP_SLOP）仍然算一次「点击」，
+    // 由下面那段 touchend 判定放大 / 收回预览框；拖过了就只当平移。
+    // 桌面端版式不走这套：它没有「点一下把预览放大到全屏」的玩法，
+    // 触摸屏（平板、触控笔记本）上的单指必须和鼠标一样直接拖图，
+    // 否则整段触摸都被吞掉，图片在手触设备上根本移不动。
+    const proSingleFinger = isProUi && !isProDesktop && e.touches.length < 2
+    if (proSingleFinger) {
+      tapRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() }
+      if (!previewExpanded) {
+        setActiveLayerIdx(layerIdx)
+        return
+      }
+    } else {
+      // 双指一落，之前那次单指按下就不该再算作点击
+      tapRef.current = null
+    }
     if (e.touches.length >= 2) {
       const t0 = e.touches[0], t1 = e.touches[1]
-      setDragMode('pinch-rotate')
+      // Pro 界面只用双指「移动 + 缩放」；旧版编辑器沿用「缩放 + 旋转」
+      setDragMode(isProUi ? 'pinch' : 'pinch-rotate')
       setDragStart({
         x: (t0.clientX + t1.clientX) / 2,
         y: (t0.clientY + t1.clientY) / 2,
@@ -1083,33 +716,23 @@ export function TemplateEditor() {
     }
     setDragStartState({ x: state.position.x, y: state.position.y, scale: state.scale, rotation: state.rotation })
     setActiveLayerIdx(layerIdx)
-    // 成组联动：记录同组其他交互图层初始位置
-    groupDragRef.current = null
-    if (device) {
-      const layer = device.layers[layerIdx]
-      if (layer?.group_id) {
-        const members = device.layers
-          .map((l, i) => ({ l, i }))
-          .filter(({ l, i }) => l.group_id === layer.group_id && l.allow_user_upload && i !== layerIdx)
-          .map(({ i }) => {
-            const s = layerStatesRef.current[i]
-            return { realIdx: i, startX: s?.position.x ?? 0, startY: s?.position.y ?? 0 }
-          })
-        if (members.length > 0) groupDragRef.current = { gid: layer.group_id, members }
-      }
-    }
-  }, [device])
+    // 成组联动：记录同组其他交互图层初始状态
+    captureGroupMembers(layerIdx)
+  }, [isProUi, isProDesktop, previewExpanded, captureGroupMembers])
 
   const handleScaleMouseDown = useCallback((layerIdx: number, mode: DragMode, e: React.MouseEvent) => {
     e.stopPropagation()
     e.preventDefault()
     const state = layerStatesRef.current[layerIdx]
     if (!state) return
+    armDragEnd()
     setDragMode(mode)
     setDragStart({ x: e.clientX, y: e.clientY })
     setDragStartState({ x: state.position.x, y: state.position.y, scale: state.scale, rotation: state.rotation })
     setActiveLayerIdx(layerIdx)
-  }, [])
+    // 成组联动：缩放/旋转手柄同样是整组联动，记录同组其他图层初始状态
+    captureGroupMembers(layerIdx)
+  }, [armDragEnd, captureGroupMembers])
 
   const handleScaleTouchStart = useCallback((layerIdx: number, mode: DragMode, e: React.TouchEvent) => {
     e.stopPropagation()
@@ -1119,89 +742,154 @@ export function TemplateEditor() {
     setDragStart({ x: e.touches[0].clientX, y: e.touches[0].clientY })
     setDragStartState({ x: state.position.x, y: state.position.y, scale: state.scale, rotation: state.rotation })
     setActiveLayerIdx(layerIdx)
-  }, [])
+    captureGroupMembers(layerIdx)
+  }, [captureGroupMembers])
 
   // 全局 mouse drag
   useEffect(() => {
     if (!dragMode || activeLayerIdx === null) return
     const onMouseMove = (e: MouseEvent) => {
+      // 没按住任何键还在收到 mousemove，说明这次拖动的 mouseup 丢了（在窗口外松手等）：
+      // 就地收尾，不能让图片继续跟着光标走。
+      if (e.buttons === 0) { groupDragRef.current = null; setDragMode(null); return }
       const dx = e.clientX - dragStart.x
       const dy = e.clientY - dragStart.y
+      /** 预览框在抽屉展开 / 全屏放大时会整体缩放，指针位移要按「设备→屏幕」的总倍数还原回容器坐标系 */
+      const renderScale = previewScale * previewRenderScale
+      /** 指针坐标 → 容器坐标系（容器当前被 translate + scale 过，getBoundingClientRect 已含这两层） */
+      const toContainer = (rect: DOMRect, cx: number, cy: number) => ({
+        x: (cx - rect.left) / previewRenderScale,
+        y: (cy - rect.top) / previewRenderScale,
+      })
       if (dragMode === 'move') {
         const display = getImageDisplay(activeLayerIdx)
         const layer = device?.layers[activeLayerIdx]
-        const raw = { x: dragStartState.x + dx / previewScale, y: dragStartState.y + dy / previewScale }
+        const raw = { x: dragStartState.x + dx / renderScale, y: dragStartState.y + dy / renderScale }
         const snapped = display && layer
           ? snapToEdges(raw.x + display.baseX, raw.y + display.baseY, display.dw, display.dh, dragStartState.scale, display.frameW, display.frameH)
           : raw
         setLayerStates(prev => {
-          const next: Record<number, any> = {
+          const next: Record<number, LayerState> = {
             ...prev,
             [activeLayerIdx]: {
               ...prev[activeLayerIdx],
               position: display ? { x: snapped.x - display.baseX, y: snapped.y - display.baseY } : snapped,
             },
           }
-          // 成组联动：同步位置增量到同组其他图层
-          if (groupDragRef.current) {
-            for (const m of groupDragRef.current.members) {
-              if (prev[m.realIdx]) {
-                next[m.realIdx] = {
-                  ...prev[m.realIdx],
-                  position: { x: m.startX + dx / previewScale, y: m.startY + dy / previewScale },
-                }
-              }
-            }
-          }
-          return next
+          // 成组联动：把这次位移增量同步给同组其他图层
+          return syncGroupMembers(next, { dx: dx / renderScale, dy: dy / renderScale })
         })
       } else if (dragMode.startsWith('scale-')) {
         const rect = containerRef.current!.getBoundingClientRect()
         const center = getImageTransformCenter(activeLayerIdx, { x: dragStartState.x, y: dragStartState.y })
-        const startDist = Math.sqrt((dragStart.x - rect.left - center.x) ** 2 + (dragStart.y - rect.top - center.y) ** 2)
-        const curDist = Math.sqrt((e.clientX - rect.left - center.x) ** 2 + (e.clientY - rect.top - center.y) ** 2)
+        const from = toContainer(rect, dragStart.x, dragStart.y)
+        const cur = toContainer(rect, e.clientX, e.clientY)
+        const startDist = Math.sqrt((from.x - center.x) ** 2 + (from.y - center.y) ** 2)
+        const curDist = Math.sqrt((cur.x - center.x) ** 2 + (cur.y - center.y) ** 2)
         if (startDist > 0) {
           const newScale = Math.max(0.1, Math.min(5, dragStartState.scale * (curDist / startDist)))
-          setLayerStates(prev => ({ ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], scale: newScale } }))
+          setLayerStates(prev => syncGroupMembers(
+            { ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], scale: newScale } },
+            { scaleFactor: newScale / (dragStartState.scale || 1) },
+          ))
         }
       } else if (dragMode.startsWith('rotate-')) {
         const rect = containerRef.current!.getBoundingClientRect()
         const center = getImageTransformCenter(activeLayerIdx, { x: dragStartState.x, y: dragStartState.y })
-        const startAngle = Math.atan2(dragStart.y - rect.top - center.y, dragStart.x - rect.left - center.x)
-        const curAngle = Math.atan2(e.clientY - rect.top - center.y, e.clientX - rect.left - center.x)
+        const from = toContainer(rect, dragStart.x, dragStart.y)
+        const cur = toContainer(rect, e.clientX, e.clientY)
+        const startAngle = Math.atan2(from.y - center.y, from.x - center.x)
+        const curAngle = Math.atan2(cur.y - center.y, cur.x - center.x)
         const newRot = dragStartState.rotation + (curAngle - startAngle) * (180 / Math.PI)
-        setLayerStates(prev => ({ ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], rotation: newRot } }))
+        setLayerStates(prev => syncGroupMembers(
+          { ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], rotation: newRot } },
+          { rotationDelta: newRot - dragStartState.rotation },
+        ))
       }
     }
     const onMouseUp = () => { groupDragRef.current = null; setDragMode(null) }
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup', onMouseUp)
     return () => { window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp) }
-  }, [dragMode, dragStart, dragStartState, activeLayerIdx, previewScale, device, getImageDisplay, getImageTransformCenter])
+  }, [dragMode, dragStart, dragStartState, activeLayerIdx, previewScale, previewRenderScale, device, getImageDisplay, getImageTransformCenter])
+
+  /* ── 鼠标：松手时判定这次按下算不算一次「点击图片」，是就切换全屏预览 ──
+     单独挂一套 window 监听，不并进上面那段依赖 dragMode 的拖动逻辑：
+     那段要等 React 渲染完才挂上 mouseup，按得特别快的点击会抢在它前面（脚本化点击更是必然），
+     结果就是「点了没反应」。这里常驻监听，只读 ref，所以不挑时序。
+     只在移动端版式生效：PC 上的预览框没有「点一下放大到全屏」这套玩法，
+     放进来的话点一次图片会把 previewExpanded 置真，指针位移换算全被那层缩放带偏。 */
+  useEffect(() => {
+    if (!isProUi || isProDesktop) return
+    const onMove = (e: MouseEvent) => {
+      const tap = mouseTapRef.current
+      if (tap && (Math.abs(e.clientX - tap.x) > TAP_SLOP || Math.abs(e.clientY - tap.y) > TAP_SLOP)) {
+        mouseTapMovedRef.current = true
+      }
+    }
+    const onUp = () => {
+      const tap = mouseTapRef.current
+      mouseTapRef.current = null
+      // 挪动过就只是拖动调图，不算点击。标记要一并复位，否则下一次点击会被上一次的拖动带偏。
+      const moved = mouseTapMovedRef.current
+      mouseTapMovedRef.current = false
+      if (!tap || moved) return
+      // 紧随其后的 click 丢掉：那一下本来会去取消选中图层
+      suppressPreviewClickRef.current = true
+      // 抽屉开着时，点预览框仍然是「收起抽屉」，和触摸那一路保持一致
+      if (activeSheet) { setActiveSheet(null); return }
+      togglePreviewExpanded()
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+  }, [isProUi, isProDesktop, activeSheet, togglePreviewExpanded])
 
   // 全局 touch drag
   useEffect(() => {
     if (!dragMode || activeLayerIdx === null) return
     const onTouchMove = (e: TouchEvent) => {
       e.preventDefault()
-      if (dragMode === 'pinch-rotate' && e.touches.length >= 2) {
+      /** 预览框在抽屉展开 / 全屏放大时会整体缩放，指针位移要按「设备→屏幕」的总倍数还原回设备坐标系 */
+      const renderScale = previewScale * previewRenderScale
+      /** 指针坐标 → 容器坐标系（容器当前被 translate + scale 过，getBoundingClientRect 已含这两层） */
+      const toContainer = (rect: DOMRect, cx: number, cy: number) => ({
+        x: (cx - rect.left) / previewRenderScale,
+        y: (cy - rect.top) / previewRenderScale,
+      })
+      // 双指手势有两种：Pro 界面用 'pinch'（只移动 + 缩放），旧版编辑器用 'pinch-rotate'（再带旋转）。
+      // 两者走同一段换算，只有旋转那一项按模式取舍。
+      if ((dragMode === 'pinch' || dragMode === 'pinch-rotate') && e.touches.length >= 2) {
         const t0 = e.touches[0], t1 = e.touches[1]
         const curDist = Math.sqrt((t1.clientX - t0.clientX) ** 2 + (t1.clientY - t0.clientY) ** 2)
         const curAngle = Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX)
         const startDist = (dragStart as any)._pinchDist || 1
         const startAngle = (dragStart as any)._pinchAngle || 0
         const newScale = Math.max(0.1, Math.min(5, dragStartState.scale * (curDist / startDist)))
-        const newRot = dragStartState.rotation + (curAngle - startAngle) * (180 / Math.PI)
         const cx = (t0.clientX + t1.clientX) / 2
         const cy = (t0.clientY + t1.clientY) / 2
-        setLayerStates(prev => ({
+        // 两指距离之比 = 缩放，两指中点的位移 = 移动（两种手势一次完成，不用分先后）
+        const pinchScaleFactor = newScale / (dragStartState.scale || 1)
+        const pinchRotationDelta = dragMode === 'pinch-rotate'
+          ? (curAngle - startAngle) * (180 / Math.PI)
+          : 0
+        setLayerStates(prev => syncGroupMembers({
           ...prev,
           [activeLayerIdx]: {
             ...prev[activeLayerIdx],
             scale: newScale,
-            rotation: newRot,
-            position: { x: dragStartState.x + (cx - dragStart.x) / previewScale, y: dragStartState.y + (cy - dragStart.y) / previewScale },
+            // Pro 界面的双指手势不旋转：角度保持进入手势时的值
+            rotation: dragStartState.rotation + pinchRotationDelta,
+            position: { x: dragStartState.x + (cx - dragStart.x) / renderScale, y: dragStartState.y + (cy - dragStart.y) / renderScale },
           },
+        }, {
+          dx: (cx - dragStart.x) / renderScale,
+          dy: (cy - dragStart.y) / renderScale,
+          scaleFactor: pinchScaleFactor,
+          rotationDelta: pinchRotationDelta,
         }))
         return
       }
@@ -1211,47 +899,47 @@ export function TemplateEditor() {
       if (dragMode === 'move') {
         const display = getImageDisplay(activeLayerIdx)
         const layer = device?.layers[activeLayerIdx]
-        const raw = { x: dragStartState.x + dx / previewScale, y: dragStartState.y + dy / previewScale }
+        const raw = { x: dragStartState.x + dx / renderScale, y: dragStartState.y + dy / renderScale }
         const snapped = display && layer
           ? snapToEdges(raw.x + display.baseX, raw.y + display.baseY, display.dw, display.dh, dragStartState.scale, display.frameW, display.frameH)
           : raw
         setLayerStates(prev => {
-          const next: Record<number, any> = {
+          const next: Record<number, LayerState> = {
             ...prev,
             [activeLayerIdx]: {
               ...prev[activeLayerIdx],
               position: display ? { x: snapped.x - display.baseX, y: snapped.y - display.baseY } : snapped,
             },
           }
-          // 成组联动：同步位置增量到同组其他图层
-          if (groupDragRef.current) {
-            for (const m of groupDragRef.current.members) {
-              if (prev[m.realIdx]) {
-                next[m.realIdx] = {
-                  ...prev[m.realIdx],
-                  position: { x: m.startX + dx / previewScale, y: m.startY + dy / previewScale },
-                }
-              }
-            }
-          }
-          return next
+          // 成组联动：把这次位移增量同步给同组其他图层
+          return syncGroupMembers(next, { dx: dx / renderScale, dy: dy / renderScale })
         })
       } else if (dragMode.startsWith('scale-')) {
         const rect = containerRef.current!.getBoundingClientRect()
         const center = getImageTransformCenter(activeLayerIdx, { x: dragStartState.x, y: dragStartState.y })
-        const startDist = Math.sqrt((dragStart.x - rect.left - center.x) ** 2 + (dragStart.y - rect.top - center.y) ** 2)
-        const curDist = Math.sqrt((touch.clientX - rect.left - center.x) ** 2 + (touch.clientY - rect.top - center.y) ** 2)
+        const from = toContainer(rect, dragStart.x, dragStart.y)
+        const cur = toContainer(rect, touch.clientX, touch.clientY)
+        const startDist = Math.sqrt((from.x - center.x) ** 2 + (from.y - center.y) ** 2)
+        const curDist = Math.sqrt((cur.x - center.x) ** 2 + (cur.y - center.y) ** 2)
         if (startDist > 0) {
           const newScale = Math.max(0.1, Math.min(5, dragStartState.scale * (curDist / startDist)))
-          setLayerStates(prev => ({ ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], scale: newScale } }))
+          setLayerStates(prev => syncGroupMembers(
+            { ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], scale: newScale } },
+            { scaleFactor: newScale / (dragStartState.scale || 1) },
+          ))
         }
       } else if (dragMode.startsWith('rotate-')) {
         const rect = containerRef.current!.getBoundingClientRect()
         const center = getImageTransformCenter(activeLayerIdx, { x: dragStartState.x, y: dragStartState.y })
-        const startAngle = Math.atan2(dragStart.y - rect.top - center.y, dragStart.x - rect.left - center.x)
-        const curAngle = Math.atan2(touch.clientY - rect.top - center.y, touch.clientX - rect.left - center.x)
+        const from = toContainer(rect, dragStart.x, dragStart.y)
+        const cur = toContainer(rect, touch.clientX, touch.clientY)
+        const startAngle = Math.atan2(from.y - center.y, from.x - center.x)
+        const curAngle = Math.atan2(cur.y - center.y, cur.x - center.x)
         const newRot = dragStartState.rotation + (curAngle - startAngle) * (180 / Math.PI)
-        setLayerStates(prev => ({ ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], rotation: newRot } }))
+        setLayerStates(prev => syncGroupMembers(
+          { ...prev, [activeLayerIdx]: { ...prev[activeLayerIdx], rotation: newRot } },
+          { rotationDelta: newRot - dragStartState.rotation },
+        ))
       }
     }
     const onTouchEnd = () => {
@@ -1268,25 +956,86 @@ export function TemplateEditor() {
     }
     window.addEventListener('touchmove', onTouchMove, { passive: false })
     window.addEventListener('touchend', onTouchEnd)
-    return () => { window.removeEventListener('touchmove', onTouchMove); window.removeEventListener('touchend', onTouchEnd) }
-  }, [dragMode, dragStart, dragStartState, activeLayerIdx, previewScale, device, getImageDisplay, getImageTransformCenter])
+    // 系统打断（来电、手势返回、手掌误触被系统取消）时不会来 touchend，
+    // 漏掉的话 dragMode 会一直停在拖动状态，之后的触摸还会继续带着图片跑。
+    window.addEventListener('touchcancel', onTouchEnd)
+    return () => {
+      window.removeEventListener('touchmove', onTouchMove)
+      window.removeEventListener('touchend', onTouchEnd)
+      window.removeEventListener('touchcancel', onTouchEnd)
+    }
+  }, [dragMode, dragStart, dragStartState, activeLayerIdx, previewScale, previewRenderScale, device, getImageDisplay, getImageTransformCenter])
 
-  // 滚轮缩放
+  // 滚轮缩放：PC 版式取消了角上的手柄，滚轮（及触屏双指）就是缩放图片的方式
   useEffect(() => {
     const el = containerRef.current
-    if (!el || activeLayerIdx === null) return
+    if (!el) return
     const onWheel = (e: WheelEvent) => {
+      // 纯横向的滚轮（触控板两指横滑）不该当成缩放
+      const dir = Math.sign(e.deltaY)
+      if (dir === 0) return
+      // 没选中图层时退回到第一张已上传的图片：取消选中（点空白处）后滚不动会显得像坏了
+      const states = layerStatesRef.current
+      const fallbackIdx = interactiveLayers.find(({ realIdx }) => states[realIdx]?.imageUrl)?.realIdx
+      // 「多图层同图」的组只有最上面那层能被操作：滚轮落在组内其他层时要转交给它，
+      // 否则会缩放一张压在下面、用户根本点不中的图（同 resolveGroupAnchors 的约定）
+      const groupAnchors = resolveGroupAnchors(device?.layers ?? [])
+      const pickedIdx = activeLayerIdx ?? fallbackIdx
+      const idx = pickedIdx == null ? undefined : (groupAnchors.get(pickedIdx) ?? pickedIdx)
+      if (idx == null || !states[idx]) return
       e.preventDefault()
-      const delta = e.deltaY > 0 ? -0.08 : 0.08
+      // 按比例缩放：小图和大图每一格滚轮的视觉变化一致
+      const factor = dir > 0 ? 1 / 1.08 : 1.08
+      // 同组图层共用同一张用户图片，缩放必须整组一起动（移动端双指捏合走的就是 syncGroupMembers）。
+      // 触到 0.1 / 5 倍的上下限时，按「实际生效的倍数」同步，组内不会越滚越不同步。
+      const groupIdxs = getSharedUploadLayerIndexes(idx)
       setLayerStates(prev => {
-        const s = prev[activeLayerIdx]
+        const s = prev[idx]
         if (!s) return prev
-        return { ...prev, [activeLayerIdx]: { ...s, scale: Math.max(0.1, Math.min(5, s.scale + delta)) } }
+        const nextScale = Math.max(0.1, Math.min(5, s.scale * factor))
+        const applied = s.scale > 0 ? nextScale / s.scale : 1
+        const next: Record<number, LayerState> = { ...prev, [idx]: { ...s, scale: nextScale } }
+        for (const memberIdx of groupIdxs) {
+          if (memberIdx === idx) continue
+          const member = prev[memberIdx]
+          if (!member) continue
+          next[memberIdx] = { ...member, scale: Math.max(0.1, Math.min(5, member.scale * applied)) }
+        }
+        return next
       })
+      setActiveLayerIdx(idx)
     }
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [activeLayerIdx])
+    // 依赖里必须带版式开关：三套版式各有自己的预览容器，
+    // 切换版式（跨断点拉伸窗口、Pro 与旧版互换）会换掉这个 DOM 节点，
+    // 依赖不变就不会重挂，滚轮缩放会直接失效。
+  }, [activeLayerIdx, interactiveLayers, isProUi, isProDesktop, device, getSharedUploadLayerIndexes])
+
+  /* ── 触摸：松手时判定这次单指触摸算不算一次「点击图片」，是就切换全屏预览 ── */
+  useEffect(() => {
+    if (!isProUi) return
+    const onEnd = (e: TouchEvent) => {
+      // 触摸结束这一下要记时间：紧随其后的那套补发鼠标事件（mouseup 等）不能被当成鼠标点击
+      lastTouchAtRef.current = performance.now()
+      const tap = tapRef.current
+      tapRef.current = null
+      if (!tap) return
+      const touch = e.changedTouches[0]
+      if (!touch) return
+      if (Math.abs(touch.clientX - tap.x) > TAP_SLOP || Math.abs(touch.clientY - tap.y) > TAP_SLOP) return
+      if (Date.now() - tap.t > TAP_HOLD_MS) return
+      // 抽屉开着时，点预览框仍然是「收起抽屉」，不是放大预览
+      if (activeSheet) { setActiveSheet(null); return }
+      togglePreviewExpanded()
+    }
+    window.addEventListener('touchend', onEnd)
+    window.addEventListener('touchcancel', onEnd)
+    return () => {
+      window.removeEventListener('touchend', onEnd)
+      window.removeEventListener('touchcancel', onEnd)
+    }
+  }, [isProUi, activeSheet, togglePreviewExpanded])
 
   const resetTransform = useCallback((layerIdx: number) => {
     const adjustments = device?.layers[layerIdx]?.adjustments
@@ -1340,9 +1089,9 @@ export function TemplateEditor() {
 
     // document.fonts.ready 只表示当前队列完成；逐图层 load 才能保证 Canvas 命中具体字重。
     await document.fonts.ready
-    await Promise.all(sortedLayers.flatMap(({ layer }) => {
+    await Promise.all(sortedLayers.flatMap(({ layer, realIdx }) => {
       if (layer.type !== 'text') return []
-      const style = resolveTextStyle(layer, device.width, device.height)
+      const style = resolveTextStyleWithOverride(layer, device.width, device.height, textAlignOverrides[realIdx])
       if (!style.fontFamily) return []
       const family = style.fontFamily.includes(' ') ? `"${style.fontFamily}"` : style.fontFamily
       const shorthand = `${style.fontStyle} ${style.fontWeight} ${style.fontSize}px ${family}`
@@ -1386,11 +1135,64 @@ export function TemplateEditor() {
         img.src = src
       })
 
+    /**
+     * 图片图层的「SVG 形状遮罩」（管理端上传的 SVG 源码）：把这一层的绘制先落到一块
+     * 「图层方框大小」的离屏 canvas 上，再用 SVG 的可见形状 destination-in 裁掉形状之外的部分，
+     * 最后整块贴回主画布。
+     *
+     * 不能用 clip 直接解决：用户上传的图片会被拖动、缩放，甚至移出图层方框，而形状固定在方框上。
+     * 遮罩铺满图层方框（对应预览的 mask-size: 100% 100%），用户端预览、管理端预览与导出才会裁出同一个形状。
+     * paint 拿到的是「已按方框偏移」的上下文，里面的坐标仍然可以照主画布写。
+     * 传了 shadow 时投影跟着形状走（整块合成图作为一张按形状裁好的图贴回去，阴影由 canvas 生成）。
+     */
+    const drawWithSvgMask = async (
+      maskSvg: string,
+      box: { left: number; top: number; w: number; h: number },
+      paint: (target: CanvasRenderingContext2D) => void,
+      shadow?: { offsetX: number; offsetY: number; blur: number; color: string },
+    ) => {
+      const maskUri = svgShapeMaskDataUri(maskSvg)
+      const regionX = Math.round(box.left)
+      const regionY = Math.round(box.top)
+      const regionW = Math.max(1, Math.round(box.w))
+      const regionH = Math.max(1, Math.round(box.h))
+      if (!maskUri) { paint(ctx); return }
+      const layerCanvas = document.createElement('canvas')
+      layerCanvas.width = regionW
+      layerCanvas.height = regionH
+      const layerCtx = layerCanvas.getContext('2d')
+      if (!layerCtx) { paint(ctx); return }
+      layerCtx.translate(-regionX, -regionY)
+      paint(layerCtx)
+      try {
+        const maskImg = await loadImage(maskUri)
+        layerCtx.setTransform(1, 0, 0, 1, 0, 0)
+        layerCtx.globalAlpha = 1
+        layerCtx.globalCompositeOperation = 'destination-in'
+        layerCtx.drawImage(maskImg, 0, 0, regionW, regionH)
+        layerCtx.globalCompositeOperation = 'source-over'
+      } catch (error) {
+        // 遮罩加载失败就退回整框绘制：宁可少一层裁剪，也不能让这一层整个消失
+        console.warn('[TemplateEditor] SVG 形状遮罩加载失败，退回整框绘制:', error)
+      }
+      ctx.save()
+      ctx.globalAlpha = 1
+      if (shadow) {
+        ctx.shadowOffsetX = shadow.offsetX
+        ctx.shadowOffsetY = shadow.offsetY
+        ctx.shadowBlur = shadow.blur
+        ctx.shadowColor = shadow.color
+      }
+      ctx.drawImage(layerCanvas, regionX, regionY)
+      ctx.restore()
+    }
+
     for (const { layer, realIdx } of sortedLayers) {
       const css = {
         ...parseCssBlock(layer.css_code || ''),
         ...parseCssBlock(layer.css_position_code || ''),
       }
+      // 特殊效果（透明度 / 背景模糊）对所有图层类型都生效，文字图层同样有管理端设置的背景模糊
       const fx = layer.effects
       const layerAlpha = fx && fx.opacity < 100 ? fx.opacity / 100 : parseFloat(css['opacity'] || '1')
       const skipByVisible = layer.visible_in_export === false
@@ -1399,7 +1201,9 @@ export function TemplateEditor() {
       if (skipByVisible) continue
 
       // ── 通用：解析矩形位置（CSS left/top/width/height，缺失时回退到 x/y 和 device 尺寸） ──
-      const rect = resolveLayerRect(layer, css, device.width, device.height)
+      // svg 图层用「内容矩形」：宽高取 SVG 文件自己声明的尺寸，背景模糊才会贴着图形本身，
+      // 而不是落在一块 100×100 的兜底方框上。
+      const rect = resolveLayerContentRect(layer, css, device.width, device.height)
       const left = rect.left * scale
       const top = rect.top * scale
       const w = rect.w * scale
@@ -1409,36 +1213,37 @@ export function TemplateEditor() {
       const boxShadow = css['box-shadow'] || css['boxShadow']
       const cssRotation = resolveCssRotation(css.transform) // CSS transform 中的旋转角度
 
-      /* ── 绘制圆角矩形路径的 helper ── */
-      const traceRoundRect = (lx: number, ly: number, rw: number, rh: number, br: number[]) => {
+      /* ── 绘制圆角矩形路径的 helper ──
+         带 SVG 形状遮罩的图层会先画进离屏 canvas，所以这里统一把「目标上下文」当参数传入（默认主画布）。 */
+      const traceRoundRect = (lx: number, ly: number, rw: number, rh: number, br: number[], c: CanvasRenderingContext2D = ctx) => {
         // CSS 规范：当 border-radius 超过元素尺寸的一半时，浏览器会按比例缩小。
         // Canvas arcTo 不会自动 clamp，超限会导致 lineTo 目标点反向、路径自交叉（椭圆/胶囊形）。
         const maxR = Math.min(rw, rh) / 2
         let [tl, tr, br2, bl] = br.map(v => Math.min(v, maxR)) as [number, number, number, number]
-        ctx.moveTo(lx + tl, ly)
-        ctx.lineTo(lx + rw - tr, ly)
-        ctx.arcTo(lx + rw, ly, lx + rw, ly + tr, tr)
-        ctx.lineTo(lx + rw, ly + rh - br2)
-        ctx.arcTo(lx + rw, ly + rh, lx + rw - br2, ly + rh, br2)
-        ctx.lineTo(lx + bl, ly + rh)
-        ctx.arcTo(lx, ly + rh, lx, ly + rh - bl, bl)
-        ctx.lineTo(lx, ly + tl)
-        ctx.arcTo(lx, ly, lx + tl, ly, tl)
-        ctx.closePath()
+        c.moveTo(lx + tl, ly)
+        c.lineTo(lx + rw - tr, ly)
+        c.arcTo(lx + rw, ly, lx + rw, ly + tr, tr)
+        c.lineTo(lx + rw, ly + rh - br2)
+        c.arcTo(lx + rw, ly + rh, lx + rw - br2, ly + rh, br2)
+        c.lineTo(lx + bl, ly + rh)
+        c.arcTo(lx, ly + rh, lx, ly + rh - bl, bl)
+        c.lineTo(lx, ly + tl)
+        c.arcTo(lx, ly, lx + tl, ly, tl)
+        c.closePath()
       }
-      const roundRect = (lx: number, ly: number, rw: number, rh: number, br: number[]) => {
-        ctx.beginPath()
-        traceRoundRect(lx, ly, rw, rh, br)
+      const roundRect = (lx: number, ly: number, rw: number, rh: number, br: number[], c: CanvasRenderingContext2D = ctx) => {
+        c.beginPath()
+        traceRoundRect(lx, ly, rw, rh, br, c)
       }
 
       /* ── 图片图层裁剪：与预览保持一致 — 只用 border-radius，彻底忽略 CSS clip-path ── */
-      const applyImageClip = (lx: number, ly: number, rw: number, rh: number) => {
+      const applyImageClip = (lx: number, ly: number, rw: number, rh: number, c: CanvasRenderingContext2D = ctx) => {
         if (borderRadiusPx) {
           const br = borderRadiusPx.map(v => v * scale) as [number, number, number, number]
-          roundRect(lx, ly, rw, rh, br)
+          roundRect(lx, ly, rw, rh, br, c)
         } else {
-          ctx.beginPath()
-          ctx.rect(lx, ly, rw, rh)
+          c.beginPath()
+          c.rect(lx, ly, rw, rh)
         }
       }
 
@@ -1496,13 +1301,126 @@ export function TemplateEditor() {
         clearBoxShadow()
       }
 
+      /* ── 背景模糊（毛玻璃）──
+         canvas 没有 backdrop-filter：只能把这一层下方的画面取回来做软件模糊，再画图层自己。
+         语义和预览里那个兄弟 overlay 完全一致（同样带 8% 白、同样受 SVG 遮罩裁剪），导出才不会与预览走样。
+         取样范围只取图层自己的方框：Chrome 的 backdrop-filter 只能拿元素边框盒内的背景当模糊源，
+         预览就是这个观感。曾经按 3σ 往外扩取样（想做"真实玻璃"），结果是同一个毛玻璃在预览里
+         是「这一小块的平均色」、在导出里是「一大片区域的平均色」——半径越大差得越狠，
+         158px 配 62×62 的小圆最夸张（预览近白、导出中灰）。所以这里不外扩，与预览逐像素对齐。
+         box 用导出像素；cssW/cssH 是同一块框在设备坐标系下的尺寸，只有解析 clip-path 用得到。
+         maskSvg 传 SVG 源码时，模糊只会留在 SVG 真正画出来的形状里（对应预览的 mask-image）。 */
+      const applyBackdropBlur = async (
+        blurPx: number,
+        box: { left: number; top: number; w: number; h: number; cssW: number; cssH: number },
+        maskSvg?: string,
+      ) => {
+        const regionX = Math.round(box.left)
+        const regionY = Math.round(box.top)
+        const regionW = Math.max(1, Math.round(box.w))
+        const regionH = Math.max(1, Math.round(box.h))
+        const sigma = blurPx * scale
+        // 取样框就是图层方框本身（与预览的 backdrop-filter 同范围），越界时夹回画布：
+        // 源矩形一旦越界，drawImage 会自己缩放，取回内容的坐标就错位了
+        const sampleX = Math.max(0, regionX)
+        const sampleY = Math.max(0, regionY)
+        const sampleW = Math.min(canvas.width, regionX + regionW) - sampleX
+        const sampleH = Math.min(canvas.height, regionY + regionH) - sampleY
+        if (sampleW < 1 || sampleH < 1) return
+        // createBlurredRegion 内部自带兜底：读不到像素（跨域污染 / WebView 限制 / 内存不足）
+        // 或 putImageData 写不回去时，改用不读像素的降采样近似，绝不让模糊整块消失。
+        // 底色用设备背景色：画布圆角外的透明像素一旦参与模糊，就会把模糊结果的 alpha 拉低，
+        // 大半径下整块变成半透明，回填时下面没糊的画面透上来 —— 看着就是「没糊」。
+        let blurCanvas = createBlurredRegion(canvas, sampleX, sampleY, sampleW, sampleH, sigma, device.background || '#FFFFFF')
+        if (!blurCanvas) return
+
+        // SVG 图层：模糊和那 8% 白都只在 SVG 的可见形状里，图层方框的透明部分不会被糊出方块。
+        // 遮罩用的是「形状」（不透明度强制为 1），与预览的 mask-image 完全同一份数据。
+        const maskUri = maskSvg ? svgShapeMaskDataUri(maskSvg) : undefined
+        let whiteWashIncluded = false
+        if (maskUri) {
+          try {
+            const maskImg = await loadImage(maskUri)
+            const masked = document.createElement('canvas')
+            masked.width = sampleW
+            masked.height = sampleH
+            const maskCtx = masked.getContext('2d')
+            if (maskCtx) {
+              maskCtx.drawImage(blurCanvas, 0, 0)
+              maskCtx.globalCompositeOperation = 'destination-in'
+              maskCtx.drawImage(maskImg, regionX - sampleX, regionY - sampleY, regionW, regionH)
+              maskCtx.globalCompositeOperation = 'source-atop'
+              maskCtx.fillStyle = 'rgba(255,255,255,0.08)'
+              maskCtx.fillRect(0, 0, sampleW, sampleH)
+              blurCanvas = masked
+              whiteWashIncluded = true
+            }
+          } catch (error) {
+            // SVG 挡不住就退回整框模糊，总比整个模糊消失强
+            console.warn('[TemplateEditor] SVG 背景模糊遮罩加载失败，退回整框模糊:', error)
+          }
+        }
+
+        ctx.save()
+        const backdropClipPath = getClipPath(css)
+        const backdropPoints = backdropClipPath ? parseClipPathToPoints(backdropClipPath, box.cssW, box.cssH) : null
+        if (backdropPoints && backdropPoints.length > 1) {
+          ctx.beginPath()
+          ctx.moveTo(box.left + backdropPoints[0][0] * scale, box.top + backdropPoints[0][1] * scale)
+          for (let i = 1; i < backdropPoints.length; i++) {
+            ctx.lineTo(box.left + backdropPoints[i][0] * scale, box.top + backdropPoints[i][1] * scale)
+          }
+          ctx.closePath()
+          ctx.clip()
+        } else if (borderRadiusPx) {
+          roundRect(box.left, box.top, box.w, box.h, borderRadiusPx.map(v => v * scale) as [number, number, number, number])
+          ctx.clip()
+        } else {
+          ctx.beginPath()
+          ctx.rect(box.left, box.top, box.w, box.h)
+          ctx.clip()
+        }
+        ctx.drawImage(blurCanvas, sampleX, sampleY, sampleW, sampleH)
+        if (!whiteWashIncluded) {
+          ctx.fillStyle = 'rgba(255,255,255,0.08)'
+          ctx.fillRect(box.left, box.top, box.w, box.h)
+        }
+        ctx.restore()
+      }
+
+      // 文字图层的位置/尺寸由排版决定，和 CSS 框不是一回事：背景模糊要糊的是文字框，
+      // 跟预览里那个 overlay 用的是同一组数值（宽高缺失时回落到行高）。
+      const textStyleForBlur = layer.type === 'text'
+        ? resolveTextStyleWithOverride(layer, device.width, device.height, textAlignOverrides[realIdx])
+        : null
+
       // ── CSS transform 旋转：与预览保持一致 ──
       const cssRotationRad = cssRotation * Math.PI / 180
-      if (cssRotationRad !== 0) {
-        ctx.save()
+      const hasLayerTransform = layer.type !== 'text' && (cssRotationRad !== 0 || layer.flip_horizontal || layer.flip_vertical)
+      // 背景模糊：先把下方画面糊掉（在图层自己的 transform 之前做，模糊区域按未旋转的框取）
+      // 模糊半径来自管理端「特殊效果」或图层 CSS 里的 backdrop-filter，两边都认（见 resolveBackdropBlurPx）。
+      const backdropBlurPx = resolveBackdropBlurPx(layer, css)
+      if (backdropBlurPx > 0) {
+        // SVG 图层用自身形状裁剪；图片图层配了 SVG 形状遮罩时，毛玻璃同样只落在形状里
+        const svgBlurMask = layer.type === 'svg'
+          ? layer.css_code || ''
+          : (layer.type === 'image' ? layer.mask_svg : undefined)
+        await applyBackdropBlur(backdropBlurPx, textStyleForBlur
+          ? {
+              left: textStyleForBlur.visualLeft * scale,
+              top: textStyleForBlur.visualTop * scale,
+              w: (textStyleForBlur.width ?? 0) * scale,
+              h: (textStyleForBlur.height ?? textStyleForBlur.lineHeightPx) * scale,
+              cssW: textStyleForBlur.width ?? 0,
+              cssH: textStyleForBlur.height ?? textStyleForBlur.lineHeightPx,
+            }
+          : { left, top, w, h, cssW: rect.w, cssH: rect.h }, svgBlurMask)
+      }
+      if (hasLayerTransform) {        ctx.save()
         const cx = left + w / 2, cy = top + h / 2
         ctx.translate(cx, cy)
-        ctx.rotate(cssRotationRad)
+        if (cssRotationRad !== 0) ctx.rotate(cssRotationRad)
+        ctx.scale(layer.flip_horizontal ? -1 : 1, layer.flip_vertical ? -1 : 1)
         ctx.translate(-cx, -cy)
       }
 
@@ -1510,46 +1428,88 @@ export function TemplateEditor() {
       if (uploadedState?.imageUrl) {
         try {
           const uploadedImage = await loadImage(uploadedState.imageUrl)
-          ctx.globalAlpha = layerAlpha
+          // 管理端给这一层配了 SVG 形状遮罩：整层改用离屏合成（见 drawWithSvgMask）
+          const uploadedMaskSvg = (layer.mask_svg || '').trim()
 
-          if (parsedShadow && !parsedShadow.inset) {
-            ctx.save()
-            applyBoxShadow()
-            applyImageClip(left, top, w, h)
-            ctx.fillStyle = '#000'
-            ctx.fill()
-            ctx.restore()
-            clearBoxShadow()
+          /* 「这一层怎么画」集中成一处：有遮罩时它拿到的是离屏上下文，没有遮罩时就是主画布。 */
+          const paintUploaded = (target: CanvasRenderingContext2D) => {
+            target.globalAlpha = layerAlpha
+            target.save()
+            applyImageClip(left, top, w, h, target)
+            target.clip()
+            const drawRect = resolveImageDrawRect(
+              uploadedImage.naturalWidth,
+              uploadedImage.naturalHeight,
+              { left: 0, top: 0, width: w, height: h },
+              resolveUserImageFit(css['object-fit']),
+              css['object-position'],
+            )
+            const imageCenterX = drawRect.left + drawRect.width / 2
+            const imageCenterY = drawRect.top + drawRect.height / 2
+            target.translate(left + imageCenterX + uploadedState.position.x * scale, top + imageCenterY + uploadedState.position.y * scale)
+            target.rotate(uploadedState.rotation * Math.PI / 180)
+            target.scale(uploadedState.scale, uploadedState.scale)
+            // 图层 CSS 里的 filter（模板作者常用 blur 做磨砂背景）也要一起参与，否则导出与预览不一致。
+            const exportCssFilter = css['filter'] || css['-webkit-filter']
+            // 用户在「效果-图片效果」里新调的滤镜与模板自带滤镜走同一套数值
+            const uploadedUserFx: UserImageFx | undefined = imageFx
+            // 用户上传的是手机原图（动辄几千像素），导出时只画到几百像素。
+            // 直接一次 drawImage 缩这么多倍会漏采样：细纹理（织物、发丝、纱窗、草地）
+            // 会变成摩尔纹和锯齿，导出图上比编辑器预览明显更脏。
+            // 先逐级折半到目标的 2 倍以内（每级正好 2:1，等于面积平均），
+            // 最后一步缩放倍数 ≤2，配合下面的 quality='high' 就不会丢像素。
+            const uploadedSource = shrinkToHalfLimit(
+              uploadedImage,
+              uploadedImage.naturalWidth,
+              uploadedImage.naturalHeight,
+              drawRect.width * uploadedState.scale,
+              drawRect.height * uploadedState.scale,
+            )
+            // Android 的 ctx.filter 会静默失效，图片滤镜只能用软件像素处理（见 drawSoftwareFilteredImage）：
+            // 它自己按「导出画布 1:1 的分辨率」把图片画上去，放大倍数 > 1 也不会变糊。
+            const softwareFiltered = isAndroid
+              && drawSoftwareFilteredImage(target, uploadedSource, drawRect.width, drawRect.height, layer, scale, uploadedUserFx, exportCssFilter)
+            if (!softwareFiltered) {
+              if (!isAndroid) target.filter = resolveImageFilterForExport(layer, exportCssFilter, scale, uploadedUserFx) || 'none'
+              // canvas 默认 quality='low'（2×2 抽头），大倍数缩小时必须显式开到 high
+              target.imageSmoothingEnabled = true
+              target.imageSmoothingQuality = 'high'
+              target.drawImage(uploadedSource, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
+              if (!isAndroid) target.filter = 'none'
+            }
+            target.restore()
           }
 
-          ctx.save()
-          applyImageClip(left, top, w, h)
-          ctx.clip()
-          const drawRect = resolveImageDrawRect(
-            uploadedImage.naturalWidth,
-            uploadedImage.naturalHeight,
-            { left: 0, top: 0, width: w, height: h },
-            resolveUserImageFit(css['object-fit']),
-            css['object-position'],
-          )
-          const imageCenterX = drawRect.left + drawRect.width / 2
-          const imageCenterY = drawRect.top + drawRect.height / 2
-          ctx.translate(left + imageCenterX + uploadedState.position.x * scale, top + imageCenterY + uploadedState.position.y * scale)
-          ctx.rotate(uploadedState.rotation * Math.PI / 180)
-          ctx.scale(uploadedState.scale, uploadedState.scale)
-          const uploadedSource = isAndroid
-            ? renderSoftwareFilteredImage(uploadedImage, drawRect.width, drawRect.height, layer, scale)
-            : uploadedImage
-          if (!isAndroid) ctx.filter = resolveImageFilter(layer, scale) || 'none'
-          ctx.drawImage(uploadedSource, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
-          if (!isAndroid) ctx.filter = 'none'
-          ctx.restore()
+          if (uploadedMaskSvg) {
+            await drawWithSvgMask(uploadedMaskSvg, { left, top, w, h }, paintUploaded, parsedShadow && !parsedShadow.inset
+              ? {
+                  offsetX: parsedShadow.offsetX * scale,
+                  offsetY: parsedShadow.offsetY * scale,
+                  blur: parsedShadow.blur * scale,
+                  color: parsedShadow.color,
+                }
+              : undefined)
+            // 合成完成后投影层（inset）仍按图层透明度绘制，与原路径一致
+            ctx.globalAlpha = layerAlpha
+          } else {
+            if (parsedShadow && !parsedShadow.inset) {
+              ctx.save()
+              applyBoxShadow()
+              applyImageClip(left, top, w, h)
+              ctx.fillStyle = '#000'
+              ctx.fill()
+              ctx.restore()
+              clearBoxShadow()
+            }
+            paintUploaded(ctx)
+          }
+          ctx.globalAlpha = 1
           drawInsetShadow()
         } catch (error) {
           console.error('[TemplateEditor] 用户上传图片导出失败:', uploadedState.imageUrl, error)
         }
         ctx.globalAlpha = 1
-        if (cssRotationRad !== 0) ctx.restore()
+        if (hasLayerTransform) ctx.restore()
         continue
       }
 
@@ -1561,60 +1521,28 @@ export function TemplateEditor() {
         const boxStyle = cssToProps(css) as Record<string, unknown>
         const bgColor = (boxStyle.backgroundColor as string) || ''
         // 原始 CSS 兜底：绕过 CSSOM 浏览器行为差异
-        const rawCssProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
+        const paintPolicy = resolveBoxPaintPolicy(layer, css)
+        const rawCssProps = paintPolicy.rawProps
         const rawBg = rawCssProps['background'] || rawCssProps['background-image'] || ''
         const bgImage = (boxStyle.backgroundImage as string) || (boxStyle.background as string) || rawBg || css['background-image'] || ''
         const isGradient = bgImage !== 'none' && /gradient\(/.test(bgImage)
-        // DEBUG: 导出渐变诊断
-        if ((layer.css_code || '').includes('gradient(') || (layer.css_position_code || '').includes('gradient(')) {
-          console.log('[Export DEBUG] 渐变图层', {
-            realIdx,
-            type: layer.type,
-            color_mode: layer.color_mode,
-            css_code: layer.css_code?.substring(0, 200),
-            css_position_code: layer.css_position_code?.substring(0, 200),
-            cssKeys: Object.keys(css).filter(k => k.includes('background') || k.includes('border')),
-            cssBgImage: css['background-image'],
-            cssBackground: css['background'],
-            boxStyleBgImage: boxStyle.backgroundImage,
-            boxStyleBackground: boxStyle.background,
-            boxStyleBgColor: boxStyle.backgroundColor,
-            rawBg,
-            bgImage,
-            isGradient,
-          })
-        }
-        // DEBUG: 边框诊断
-        if ((layer.css_code || '').includes('border') || (layer.css_position_code || '').includes('border')) {
-          const rawBw = rawCssProps['border-width'] || rawCssProps['border-top-width'] || ''
-          const rawBc = rawCssProps['border-color'] || rawCssProps['border-top-color'] || ''
-          console.log('[Export DEBUG] 边框图层', {
-            realIdx,
-            type: layer.type,
-            css_code: layer.css_code?.substring(0, 200),
-            cssBorderTopWidth: css['border-top-width'],
-            cssBorderWidth: css['border-width'],
-            cssBorder: css['border'],
-            cssBorderTopColor: css['border-top-color'],
-            cssBorderColor: css['border-color'],
-            rawBw,
-            rawBc,
-          })
-        }
-
-        let fillColorRaw: string
+        let fillColor: string
         if (isGradient) {
-          fillColorRaw = bgImage
+          fillColor = bgImage
         } else if (bgColor && bgColor !== 'rgba(0, 0, 0, 0)') {
-          fillColorRaw = bgColor
-        } else if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) {
-          fillColorRaw = layer.color
+          fillColor = bgColor
+        } else if (layer.type !== 'shape' && layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) {
+          fillColor = layer.color
         } else {
-          fillColorRaw = ''
+          fillColor = ''
         }
-
-        let fillColor = fillColorRaw
-        if (layer.color_mode === 'picker' && pickedColor[realIdx] && !fillColor.includes('gradient(')) fillColor = pickedColor[realIdx]
+        if (layer.color_mode === 'picker' && pickedColor[realIdx]) {
+          fillColor = layer.type === 'shape' && !paintPolicy.hasFill
+            ? ''
+            : fillColor.includes('gradient(')
+              ? recolorLinearGradient(fillColor, pickedColor[realIdx]) || fillColor
+              : pickedColor[realIdx]
+        }
         const hasFill = fillColor && fillColor !== 'transparent' && fillColor !== 'rgba(0, 0, 0, 0)'
         ctx.globalAlpha = layerAlpha
         applyBoxShadow()
@@ -1650,7 +1578,9 @@ export function TemplateEditor() {
         const borderColorRaw = css.borderTopColor || css.borderColor || css['border-top-color'] || rawBorderColor || ''
         const borderWidth = parseFloat(borderWidthRaw) || 0
         if (borderWidth > 0) {
-          const borderColor = borderColorRaw || '#000'
+          const borderColor = layer.type === 'shape' && layer.color_mode === 'picker' && !paintPolicy.hasFill && pickedColor[realIdx]
+            ? pickedColor[realIdx]
+            : borderColorRaw || '#000'
           ctx.strokeStyle = borderColor
           ctx.lineWidth = borderWidth * scale
           if (borderRadiusPx) {
@@ -1666,7 +1596,7 @@ export function TemplateEditor() {
         clearBoxShadow()
         drawInsetShadow()
         ctx.globalAlpha = 1
-        if (cssRotationRad !== 0) ctx.restore()
+        if (hasLayerTransform) ctx.restore()
         continue
       }
 
@@ -1675,8 +1605,10 @@ export function TemplateEditor() {
       // ═══════════════════════════════════════════
       if (layer.type === 'text') {
         const text = (editedTexts[realIdx] ?? layer.text_content) || ''
-        if (!text) { if (cssRotationRad !== 0) ctx.restore(); continue }
-        const textStyle = resolveTextStyle(layer, device.width, device.height)
+        if (!text) { if (hasLayerTransform) ctx.restore(); continue }
+        // 排版样式通常在上一步算背景模糊框时已经算过，这里直接复用同一份，避免两处漂移
+        const textStyle = textStyleForBlur
+          ?? resolveTextStyleWithOverride(layer, device.width, device.height, textAlignOverrides[realIdx])
         const fs = textStyle.fontSize * scale
         const lineHeight = textStyle.lineHeightPx * scale
         const boxLeft = textStyle.visualLeft * scale
@@ -1686,7 +1618,7 @@ export function TemplateEditor() {
         const lines = text.split('\n')
         const textBlockHeight = lines.length * lineHeight
         ctx.globalAlpha = layerAlpha
-        ctx.fillStyle = textStyle.color
+        ctx.fillStyle = layer.color_mode === 'picker' && pickedColor[realIdx] ? pickedColor[realIdx] : textStyle.color
         const fontFamily = textStyle.fontFamily?.includes(' ') ? `"${textStyle.fontFamily}"` : textStyle.fontFamily || 'sans-serif'
         ctx.font = `${textStyle.fontStyle} ${textStyle.fontWeight} ${fs}px ${fontFamily}`
         ctx.textAlign = (textStyle.textAlign || 'left') as CanvasTextAlign
@@ -1706,11 +1638,58 @@ export function TemplateEditor() {
         const glyphHeight = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent
         const baselineOffset = (lineHeight - glyphHeight) / 2 + metrics.actualBoundingBoxAscent
         applyBoxShadow()
-        lines.forEach((line, lineIndex) => ctx.fillText(line, tx, ty + lineIndex * lineHeight + baselineOffset))
+        const strokeColor = layer.text_stroke_color_mode === 'picker' && pickedColor[realIdx]
+          ? pickedColor[realIdx]
+          : textStyle.textStrokeColor
+        const strokeScale = textStyle.textStrokeWidth * scale
+        const strokeRender = textStyle.textStrokeType === 'center' ? strokeScale : strokeScale * 2
+        const drawStrokeLine = (line: string, y: number) => ctx.strokeText(line, tx, y)
+        if (textStyle.textStrokeWidth > 0 && strokeColor) {
+          ctx.strokeStyle = strokeColor
+          if (textStyle.textStrokeType === 'inset') {
+            // 内描边：先填充文字，再用文字形状作遮罩仅保留字形内部的描边
+            lines.forEach((line, lineIndex) => ctx.fillText(line, tx, ty + lineIndex * lineHeight + baselineOffset))
+            const pad = strokeRender * 2 + 2
+            const maskWidth = Math.max(1, Math.ceil(boxWidth + pad * 2))
+            const maskHeight = Math.max(1, Math.ceil(boxHeight + pad * 2))
+            const maskCanvas = document.createElement('canvas')
+            maskCanvas.width = maskWidth
+            maskCanvas.height = maskHeight
+            const maskCtx = maskCanvas.getContext('2d')
+            if (maskCtx) {
+              const offsetX = boxLeft - pad
+              const offsetY = boxTop - pad
+              maskCtx.font = ctx.font
+              maskCtx.textAlign = ctx.textAlign
+              maskCtx.textBaseline = ctx.textBaseline
+              ;(maskCtx as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing =
+                (ctx as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing
+              maskCtx.fillStyle = '#000'
+              lines.forEach((line, lineIndex) =>
+                maskCtx.fillText(line, tx - offsetX, ty + lineIndex * lineHeight + baselineOffset - offsetY))
+              maskCtx.globalCompositeOperation = 'source-in'
+              maskCtx.strokeStyle = strokeColor
+              maskCtx.lineWidth = strokeRender
+              maskCtx.lineJoin = 'round'
+              lines.forEach((line, lineIndex) =>
+                maskCtx.strokeText(line, tx - offsetX, ty + lineIndex * lineHeight + baselineOffset - offsetY))
+              ctx.drawImage(maskCanvas, offsetX, offsetY)
+            }
+          } else {
+            // 外描边线宽翻倍以补偿 fill 覆盖内侧一半；居中描边按设定值
+            ctx.lineWidth = strokeRender
+            ctx.lineJoin = 'round'
+            lines.forEach((line, lineIndex) => drawStrokeLine(line, ty + lineIndex * lineHeight + baselineOffset))
+            lines.forEach((line, lineIndex) => ctx.fillText(line, tx, ty + lineIndex * lineHeight + baselineOffset))
+          }
+        } else {
+          lines.forEach((line, lineIndex) => ctx.fillText(line, tx, ty + lineIndex * lineHeight + baselineOffset))
+        }
+        ctx.lineWidth = 1
         clearBoxShadow()
         drawInsetShadow()
         ctx.globalAlpha = 1
-        if (cssRotationRad !== 0) ctx.restore()
+        if (hasLayerTransform) ctx.restore()
         continue
       }
 
@@ -1719,7 +1698,7 @@ export function TemplateEditor() {
       // ═══════════════════════════════════════════
       if (layer.type === 'svg') {
         const svgCode = layer.css_code || ''
-        if (!svgCode) { if (cssRotationRad !== 0) ctx.restore(); continue }
+        if (!svgCode) { if (hasLayerTransform) ctx.restore(); continue }
         try {
           // 保留 SVG 内部每个路径、渐变、遮罩和嵌套 SVG；固定颜色只作用于 currentColor。
           let finalSvg = svgCode
@@ -1736,36 +1715,15 @@ export function TemplateEditor() {
               return `<svg${attrs} style="color:${resolvedSvgColor}">`
             })
           }
-          // SVG 数据 URI: 使用 base64 编码避免 encodeURIComponent 破坏 #/% 等特殊字符
-          const svgDataUri = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(finalSvg)))
+          // SVG 数据 URI：必须补 xmlns，否则浏览器判定解码失败（SVG 图层在导出里会整块消失，
+          // 只剩背景模糊的方框）；base64 编码避免 #/% 等字符在 URL 里被截断。
+          const svgDataUri = svgToDataUri(finalSvg)
+          if (!svgDataUri) { if (hasLayerTransform) ctx.restore(); continue }
           const svgImg = await loadImage(svgDataUri)
-          // 确定 SVG 绘制尺寸：优先使用存储的 css_width/css_height（管理端上传时保存），
-          // 其次用 CSS 解析，最后用 SVG viewBox 自然尺寸
-          let drawW = w
-          let drawH = h
-          if (!css['width'] && !css['height']) {
-            // 优先使用从管理端保存的尺寸
-            if (layer.css_width != null && layer.css_height != null) {
-              drawW = layer.css_width * scale
-              drawH = layer.css_height * scale
-            } else {
-              const svgTagMatch = svgCode.match(/<svg[^>]*>/i)
-              if (svgTagMatch) {
-                const wm = svgTagMatch[0].match(/width="([^"]+)"/i)
-                const hm = svgTagMatch[0].match(/height="([^"]+)"/i)
-                const vbm = svgTagMatch[0].match(/viewBox="([^"]+)"/i)
-                let vbW = 0, vbH = 0
-                if (vbm) {
-                  const parts = vbm[1].trim().split(/[\s,]+/).map(Number)
-                  if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) { vbW = parts[2]; vbH = parts[3] }
-                }
-                const parsedW = parseFloat(wm?.[1] || '') || vbW || 0
-                const parsedH = parseFloat(hm?.[1] || '') || vbH || 0
-                if (parsedW > 0) drawW = parsedW * scale
-                if (parsedH > 0) drawH = parsedH * scale
-              }
-            }
-          }
+          // 绘制尺寸由 resolveLayerContentRect 统一算好（CSS → css_width/css_height → SVG 自带的
+          // width/height/viewBox），和背景模糊用的是同一块框，两者不会再错位。
+          const drawW = w
+          const drawH = h
           ctx.globalAlpha = layerAlpha
           applyBoxShadow()
           ctx.drawImage(svgImg, left, top, drawW, drawH)
@@ -1773,7 +1731,7 @@ export function TemplateEditor() {
           drawInsetShadow()
           ctx.globalAlpha = 1
         } catch (e) { console.error('[TemplateEditor] SVG 导出失败:', e) }
-        if (cssRotationRad !== 0) ctx.restore()
+        if (hasLayerTransform) ctx.restore()
         continue
       }
 
@@ -1782,40 +1740,65 @@ export function TemplateEditor() {
       // ═══════════════════════════════════════════
       if (layer.type === 'image') {
         const imgUrl = layer.image_url
-        if (!imgUrl) { if (cssRotationRad !== 0) ctx.restore(); continue }
-        console.log(`[export] image "${layer.name}":`, { borderRadiusPx, clipPath: getClipPath(css), shorthand: css['border-radius'], tl: css['border-top-left-radius'], tr: css['border-top-right-radius'], br: css['border-bottom-right-radius'], bl: css['border-bottom-left-radius'] })
+        if (!imgUrl) { if (hasLayerTransform) ctx.restore(); continue }
 
         try {
           const img = await loadImage(imgUrl)
-          ctx.globalAlpha = layerAlpha
-          applyBoxShadow()
-          ctx.save()
-          applyImageClip(left, top, w, h)
-          ctx.clip()
-          const drawRect = resolveImageDrawRect(
-            img.naturalWidth,
-            img.naturalHeight,
-            { left, top, width: w, height: h },
-            css['object-fit'],
-            css['object-position'],
-          )
-          const imageCenterX = drawRect.left + drawRect.width / 2
-          const imageCenterY = drawRect.top + drawRect.height / 2
-          ctx.translate(imageCenterX, imageCenterY)
-          ctx.rotate((layer.adjustments?.rotation ?? 0) * Math.PI / 180)
-          ctx.scale(layer.adjustments?.scale ?? 1, layer.adjustments?.scale ?? 1)
-          const imageSource = isAndroid
-            ? renderSoftwareFilteredImage(img, drawRect.width, drawRect.height, layer, scale)
-            : img
-          if (!isAndroid) ctx.filter = resolveImageFilter(layer, scale) || 'none'
-          ctx.drawImage(imageSource, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
-          if (!isAndroid) ctx.filter = 'none'
-          ctx.restore()
+          // 管理端给这一层配了 SVG 形状遮罩：模板自带的图片同样只显示在形状范围内
+          const staticMaskSvg = (layer.mask_svg || '').trim()
+          const paintStatic = (target: CanvasRenderingContext2D) => {
+            target.globalAlpha = layerAlpha
+            target.save()
+            applyImageClip(left, top, w, h, target)
+            target.clip()
+            const drawRect = resolveImageDrawRect(
+              img.naturalWidth,
+              img.naturalHeight,
+              { left, top, width: w, height: h },
+              css['object-fit'],
+              css['object-position'],
+            )
+            const imageCenterX = drawRect.left + drawRect.width / 2
+            const imageCenterY = drawRect.top + drawRect.height / 2
+            target.translate(imageCenterX, imageCenterY)
+            target.rotate((layer.adjustments?.rotation ?? 0) * Math.PI / 180)
+            target.scale(layer.adjustments?.scale ?? 1, layer.adjustments?.scale ?? 1)
+            const staticCssFilter = css['filter'] || css['-webkit-filter']
+            const staticScale = layer.adjustments?.scale ?? 1
+            // 和用户上传图同样的处理：模板自带的照片也常常是几千像素，先折半再画（见上面那段注释）
+            const staticSource = shrinkToHalfLimit(img, img.naturalWidth, img.naturalHeight, drawRect.width * staticScale, drawRect.height * staticScale)
+            // 与用户上传图同一条路：Android 用软件像素处理，分辨率与导出画布 1:1（见 drawSoftwareFilteredImage）
+            const softwareFiltered = isAndroid
+              && drawSoftwareFilteredImage(target, staticSource, drawRect.width, drawRect.height, layer, scale, undefined, staticCssFilter)
+            if (!softwareFiltered) {
+              if (!isAndroid) target.filter = resolveImageFilterForExport(layer, staticCssFilter, scale) || 'none'
+              target.imageSmoothingEnabled = true
+              target.imageSmoothingQuality = 'high'
+              target.drawImage(staticSource, -drawRect.width / 2, -drawRect.height / 2, drawRect.width, drawRect.height)
+              if (!isAndroid) target.filter = 'none'
+            }
+            target.restore()
+          }
+
+          if (staticMaskSvg) {
+            await drawWithSvgMask(staticMaskSvg, { left, top, w, h }, paintStatic, parsedShadow && !parsedShadow.inset
+              ? {
+                  offsetX: parsedShadow.offsetX * scale,
+                  offsetY: parsedShadow.offsetY * scale,
+                  blur: parsedShadow.blur * scale,
+                  color: parsedShadow.color,
+                }
+              : undefined)
+          } else {
+            applyBoxShadow()
+            paintStatic(ctx)
+          }
+          ctx.globalAlpha = 1
           clearBoxShadow()
           drawInsetShadow()
         } catch (e) { console.error('[TemplateEditor] 静态图片导出失败:', imgUrl, e) }
         ctx.globalAlpha = 1
-        if (cssRotationRad !== 0) ctx.restore()
+        if (hasLayerTransform) ctx.restore()
       }
     }
 
@@ -1842,13 +1825,68 @@ export function TemplateEditor() {
     } finally {
       setExporting(false)
     }
-  }, [device, exporting, sortedLayers, layerStates, pickedColor, editedTexts, interactiveLayers, template, previewScale])
+  }, [device, exporting, sortedLayers, layerStates, pickedColor, editedTexts, interactiveLayers, template, previewScale, imageFx, textAlignOverrides])
 
   const curCursor = dragMode
     ? (dragMode === 'move' ? 'grabbing' : dragMode.startsWith('rotate') ? 'crosshair' : 'nwse-resize')
     : 'default'
   const scaleCursor = (mode: DragMode) =>
     mode === 'scale-tl' || mode === 'scale-br' ? 'nwse-resize' : 'nesw-resize'
+
+  /* ── 新版移动端界面（手环 Pro 系列）的派生数据 ── */
+  // 「签名」标签当前编辑的文字图层：默认落在第一个文字图层
+  const alignLayerIdx = alignTextIdx != null && textLayers.some(t => t.realIdx === alignTextIdx)
+    ? alignTextIdx
+    : (textLayers[0]?.realIdx ?? null)
+  const alignLayer = alignLayerIdx != null ? device?.layers[alignLayerIdx] : undefined
+  // 取色抽屉的色板：沿用第一个已提取到颜色的 picker 图层（与旧版行为一致）
+  const paletteOwnerIdx = pickerColorLayers.find(({ realIdx }) => (pickerColors[realIdx]?.length ?? 0) > 0)?.realIdx ?? null
+  const palette = paletteOwnerIdx != null ? (pickerColors[paletteOwnerIdx] || []) : []
+  const paletteCurrent = paletteOwnerIdx != null ? pickedColor[paletteOwnerIdx] : undefined
+  /** 取色作用于全部 picker 图层，和旧版一致；文字描边取色也跟随 */
+  const setAllPickerColor = (color: string) => {
+    setPickedColor(prev => {
+      const next = { ...prev }
+      for (const { realIdx } of pickerColorLayers) next[realIdx] = color
+      return next
+    })
+  }
+  const setAlign = (patch: TextAlignOverride) => {
+    if (alignLayerIdx == null) return
+    setTextAlignOverrides(prev => ({ ...prev, [alignLayerIdx]: { ...prev[alignLayerIdx], ...patch } }))
+  }
+  /** 排版按钮：单选，点哪个就只高亮哪个（水平/垂直各自独立生效，但指示只保留最后点的一个） */
+  const pickAlign = (kind: AlignKind, patch: TextAlignOverride) => {
+    setAlign(patch)
+    setAlignKind(kind)
+  }
+  /** 上传图片：优先补第一个还没有图的交互图层，其次替换当前选中的图层 */
+  const handleProUpload = () => {
+    const empty = interactiveLayers.find(({ realIdx }) => !layerStates[realIdx]?.imageUrl)
+    const target = empty?.realIdx ?? activeLayerIdx ?? interactiveLayers[0]?.realIdx
+    if (target == null) return
+    fileInputRefs.current[target]?.click()
+  }
+  const hasUploadedImage = uploadedImageIndexes.length > 0
+  /** 「图片效果-模糊度」滑杆的上限由管理端写在模板里，缺省 50px */
+  const blurMax = resolveBlurMax(template)
+  /** 顶栏「重置 / 删除」作用的图层：优先当前选中，其次第一张已上传的图片。
+   *  两个按钮上传后常驻，不要求先点中图层。 */
+  const manageLayerIdx = activeLayerIdx != null && layerStates[activeLayerIdx]?.imageUrl
+    ? activeLayerIdx
+    : (uploadedImageIndexes[0] ?? null)
+  /** 对比度 / 饱和度在数据里是「100 为中性」的百分比，滑杆上要显示成 ±（中点 0），所以进出都换算一次 */
+  const toPercent = (signed: number) => signed + 100
+  const toSigned = (percent: number) => percent - 100
+  const formatSigned = (signed: number) => (signed > 0 ? `+${signed}` : `${signed}`)
+  const alignButtons: { kind: AlignKind; patch: TextAlignOverride }[] = [
+    { kind: 'left', patch: { h: 'left' } },
+    { kind: 'hcenter', patch: { h: 'center' } },
+    { kind: 'right', patch: { h: 'right' } },
+    { kind: 'top', patch: { v: 'top' } },
+    { kind: 'vcenter', patch: { v: 'middle' } },
+    { kind: 'bottom', patch: { v: 'bottom' } },
+  ]
 
   /* ── 加载状态 ── */
   if (loading) return (
@@ -1869,6 +1907,983 @@ export function TemplateEditor() {
           )}
         </div>
       </div>
+    </div>
+  )
+
+  /* ═══════════════════════════════════════════════════════════
+     新版桌面端界面（手环 Pro 系列）
+     与移动端 Pro 是同一套编辑能力，版式换成旧版桌面那套「左侧预览框 + 右侧数据栏」：
+     预览按可用区域等比缩放，右侧数据栏按站点整体风格排成卡片流，配色全部走主题变量。
+     ═══════════════════════════════════════════════════════════ */
+  if (isProDesktop) return (
+    <div className={`h-dvh flex flex-col overflow-hidden${IS_OFFLINE ? ' safe-area-pad' : ''}`} style={{ background: 'var(--bg-primary)' }}>
+      {!IS_OFFLINE && <Navbar />}
+
+      <main className="flex-1 min-h-0 relative z-10 px-4 lg:px-6 py-4 lg:py-5">
+        <div className="flex h-full min-h-0" style={{ gap: 20, maxWidth: 1440, margin: '0 auto' }}>
+
+          {/* ── 左侧：预览编辑区 ── */}
+          <section className="poolux-card flex-1 min-w-0 flex flex-col min-h-0">
+            <div className="flex items-center flex-shrink-0" style={{ gap: 12, padding: '18px 20px 10px' }}>
+              {!IS_OFFLINE ? (
+                <Link
+                  to="/tools/watch-face"
+                  className="flex items-center justify-center flex-shrink-0 transition-colors"
+                  style={{ width: 36, height: 36, borderRadius: 10, background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)' }}
+                >
+                  <ArrowLeft className="w-4 h-4" style={{ color: 'var(--text-primary)' }} />
+                </Link>
+              ) : <div style={{ width: 4 }} />}
+              <div className="flex-1 min-w-0">
+                <h1 className="truncate" style={{ color: 'var(--text-primary)', fontSize: 16, fontWeight: 570 }}>{template.name}</h1>
+                <p style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 2 }}>
+                  {device ? `${device.name} · ${device.width}×${device.height}px` : '请先选择设备'}
+                </p>
+              </div>
+              <span className="hidden xl:inline" style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                {hasUploadedImage ? '拖动图片可平移，滚轮或双指手势可缩放' : '点击或拖拽图片到预览框即可上传'}
+              </span>
+            </div>
+
+            {/* 预览区：可用尺寸由容器实时测量，画布始终按可用区域等比缩放（不超过 1:1） */}
+            <div ref={previewWrapRef} className="flex-1 min-h-0 flex items-center justify-center" style={{ padding: 24 }}>
+              {device ? (
+                <div className="relative" style={{ width: containerWidth, height: containerHeight, cursor: curCursor }}>
+                  {/* 预览框描边：贴在外框之内 2px，圆角与画布同心 */}
+                  <div className="absolute pointer-events-none" style={{
+                    left: vpLeft - 2, top: vpTop - 2,
+                    width: previewWidth + 4, height: previewHeight + 4,
+                    borderRadius: cornerRadius + 2,
+                    border: '2px solid var(--frame-border)',
+                    zIndex: 20,
+                  }} />
+
+                  <div
+                    ref={containerRef}
+                    className="absolute"
+                    style={{ left: 0, top: 0, width: containerWidth, height: containerHeight, zIndex: 21 }}
+                    onClick={(e) => {
+                      // 点交互图层时交给图层自己处理，避免误取消选中或弹出文件选择
+                      if ((e.target as HTMLElement).closest('[data-interactive]')) return
+                      if (activeLayerIdx !== null) { setActiveLayerIdx(null); return }
+                      const firstEmpty = interactiveLayers.find(({ realIdx }) => !layerStates[realIdx]?.imageUrl)
+                      if (firstEmpty) fileInputRefs.current[firstEmpty.realIdx]?.click()
+                    }}
+                    onDragOver={(e) => { e.preventDefault(); setIsDragOver(true) }}
+                    onDragLeave={() => setIsDragOver(false)}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      setIsDragOver(false)
+                      const file = e.dataTransfer.files?.[0]
+                      if (file && file.type.startsWith('image/')) {
+                        const target = interactiveLayers.find(({ realIdx }) => !layerStates[realIdx]?.imageUrl)
+                        if (target) handleFileUpload(target.realIdx, file)
+                      }
+                    }}
+                  >
+                    {interactiveLayers.map(({ realIdx }) => (
+                      <input key={realIdx} ref={el => { fileInputRefs.current[realIdx] = el }}
+                        type="file" accept="image/*" className="hidden"
+                        onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileUpload(realIdx, f); e.target.value = '' }} />
+                    ))}
+
+                    <div className="absolute" style={{
+                      left: vpLeft,
+                      top: vpTop,
+                      width: previewWidth,
+                      height: previewHeight,
+                      borderRadius: cornerRadius,
+                      overflow: 'hidden',
+                      clipPath: `inset(0 round ${cornerRadius}px)`,
+                      WebkitClipPath: `inset(0 round ${cornerRadius}px)`,
+                    }}>
+                      {/* 未上传图片时只画一块比页面略深的占位、不画模板图层：
+                          模板里铺满画布的形状否则看起来就像「已经有内容」，与移动端保持一致。 */}
+                      <div className="absolute inset-0" style={{ background: hasUploadedImage ? (device.background || '#FFFFFF') : 'rgba(0, 0, 0, 0.06)' }} />
+                      {hasUploadedImage && (
+                        <WatchFaceLayerStack
+                          device={device}
+                          sortedLayers={sortedLayers}
+                          previewScale={previewScale}
+                          layerStates={layerStates}
+                          pickedColor={pickedColor}
+                          editedTexts={editedTexts}
+                          imageFx={imageFxByLayer}
+                          textAlignOverrides={textAlignOverrides}
+                          backdropFilterOk={backdropFilterOk}
+                          dragMode={dragMode}
+                          activeLayerIdx={activeLayerIdx}
+                          onActivateLayer={setActiveLayerIdx}
+                          onLayerMouseDown={handleMouseDown}
+                          onLayerTouchStart={handleTouchStart}
+                          onRequestUpload={(realIdx) => fileInputRefs.current[realIdx]?.click()}
+                          onSelectText={(realIdx) => {
+                            setEditingTextIdx(realIdx)
+                            setAlignTextIdx(realIdx)
+                            setAlignKind(null)
+                            setEditedTexts(prev => ({ ...prev, [realIdx]: prev[realIdx] ?? device.layers[realIdx]?.text_content ?? '' }))
+                          }}
+                        />
+                      )}
+                      {!hasUploadedImage && (
+                        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                          <p style={{ fontSize: 14, color: isDragOver ? 'var(--accent)' : 'var(--text-muted)' }}>点击此处上传图片</p>
+                        </div>
+                      )}
+                      {!hasUploadedImage && isDragOver && (
+                        <div className="absolute inset-0 pointer-events-none" style={{ boxShadow: 'inset 0 0 0 3px var(--accent)' }} />
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p style={{ color: 'var(--text-muted)', fontSize: 14 }}>请先选择设备</p>
+              )}
+            </div>
+
+            {/* 底部状态栏：缩放 / 旋转 / 偏移 */}
+            <div className="flex items-center justify-center flex-wrap flex-shrink-0" style={{ gap: 8, padding: '0 20px 18px' }}>
+              <div className="inline-flex items-center" style={{ gap: 6, padding: '4px 12px', borderRadius: 8, background: 'var(--accent-bg)' }}>
+                <span style={{ fontSize: 12, color: 'var(--accent)' }}>缩放</span>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)' }}>
+                  {activeLayerIdx !== null && layerStates[activeLayerIdx] ? (layerStates[activeLayerIdx].scale * 100).toFixed(0) : '100'}%
+                </span>
+              </div>
+              <div className="inline-flex items-center" style={{ gap: 6, padding: '4px 12px', borderRadius: 8, background: 'var(--accent-bg)' }}>
+                <span style={{ fontSize: 12, color: 'var(--accent)' }}>旋转</span>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)' }}>
+                  {activeLayerIdx !== null && layerStates[activeLayerIdx] ? layerStates[activeLayerIdx].rotation.toFixed(1) : '0.0'}°
+                </span>
+              </div>
+              {activeLayerIdx !== null && layerStates[activeLayerIdx] && (
+                <div className="inline-flex items-center" style={{ gap: 6, padding: '4px 12px', borderRadius: 8, background: 'var(--accent-bg)' }}>
+                  <span style={{ fontSize: 12, color: 'var(--accent)' }}>偏移</span>
+                  <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)' }}>
+                    {layerStates[activeLayerIdx].position.x.toFixed(0)}, {layerStates[activeLayerIdx].position.y.toFixed(0)}
+                  </span>
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* ── 右侧：数据栏 ── */}
+          <aside className="flex flex-col min-h-0 flex-shrink-0" style={{ width: 372, gap: 16 }}>
+            <div className="flex flex-col min-h-0 no-scrollbar" style={{ gap: 16, flex: 1, overflowY: 'auto', paddingRight: 2 }}>
+
+              <ProPanelCard
+                title="目标设备"
+                hint={template.devices.length > 1 ? '每个设备的编辑状态独立保存' : undefined}
+              >
+                {template.devices.length > 1 ? (
+                  <div className="grid grid-cols-2" style={{ gap: 8 }}>
+                    {template.devices.map((d, i) => (
+                      <button key={i} type="button" onClick={() => setSelectedDeviceIdx(i)}
+                        className="text-center transition-all duration-200"
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: 12,
+                          border: `1.5px solid ${selectedDeviceIdx === i ? 'var(--accent)' : 'var(--border-color)'}`,
+                          background: selectedDeviceIdx === i ? 'var(--accent-bg)' : 'var(--bg-secondary)',
+                          color: selectedDeviceIdx === i ? 'var(--accent)' : 'var(--text-secondary)',
+                          fontWeight: selectedDeviceIdx === i ? 600 : 400,
+                          cursor: 'pointer',
+                        }}>
+                        <div style={{ fontSize: 13, lineHeight: 1.3 }}>{d.name}</div>
+                        <div style={{ fontSize: 11, marginTop: 2, opacity: 0.75 }}>{d.width}×{d.height}px</div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                    {device ? `${device.name} · ${device.width}×${device.height}px` : '请先选择设备'}
+                  </p>
+                )}
+              </ProPanelCard>
+
+              <ProPanelCard
+                title="图片"
+                hint={hasUploadedImage ? '效果滑杆对全部已上传图片生效' : '点击或拖拽图片到左侧预览框上传'}
+              >
+                <div className="flex items-center" style={{ gap: 10 }}>
+                  <button
+                    type="button"
+                    onClick={handleProUpload}
+                    disabled={interactiveLayers.length === 0}
+                    className="poolux-btn poolux-btn-primary flex-1"
+                    style={{ minHeight: 40, fontSize: 14, opacity: interactiveLayers.length === 0 ? 0.5 : 1, boxShadow: 'none' }}
+                  >
+                    <RiImageLine size={18} />
+                    上传图片
+                  </button>
+                  {hasUploadedImage && manageLayerIdx != null && (
+                    <>
+                      <button
+                        type="button"
+                        title="恢复图片位置"
+                        onClick={() => { hapticTick(); resetTransform(manageLayerIdx) }}
+                        className="flex items-center justify-center flex-shrink-0 transition-colors"
+                        style={{ width: 40, height: 40, borderRadius: 12, background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', cursor: 'pointer' }}
+                      >
+                        <RotateCcw className="w-4 h-4" />
+                      </button>
+                      <button
+                        type="button"
+                        title="删除图片"
+                        onClick={() => { hapticTick(); clearImage(manageLayerIdx); setActiveLayerIdx(null) }}
+                        className="flex items-center justify-center flex-shrink-0 transition-colors"
+                        style={{ width: 40, height: 40, borderRadius: 12, background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', color: 'var(--danger)', cursor: 'pointer' }}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </>
+                  )}
+                </div>
+              </ProPanelCard>
+
+              <ProPanelCard title="图片效果" hint={hasUploadedImage ? undefined : '上传图片后生效'}>
+                <div className="flex flex-col" style={{ gap: 23 }}>
+                  <DesktopSlider
+                    label="对比度" value={toSigned(imageFx.contrast ?? 100)} min={-100} max={100} step={1}
+                    display={formatSigned(Math.round(toSigned(imageFx.contrast ?? 100)))} centerOrigin
+                    onChange={(v) => setImageFx(prev => ({ ...prev, contrast: toPercent(v) }))}
+                  />
+                  <DesktopSlider
+                    label="模糊度" value={imageFx.blur ?? 0} min={0} max={blurMax} step={1}
+                    display={`${Math.round(imageFx.blur ?? 0)}px`} centerOrigin={false}
+                    onChange={(v) => setImageFx(prev => ({ ...prev, blur: v }))}
+                  />
+                  <DesktopSlider
+                    label="饱和度" value={toSigned(imageFx.saturation ?? 100)} min={-100} max={100} step={1}
+                    display={formatSigned(Math.round(toSigned(imageFx.saturation ?? 100)))} centerOrigin
+                    onChange={(v) => setImageFx(prev => ({ ...prev, saturation: toPercent(v) }))}
+                  />
+                </div>
+              </ProPanelCard>
+
+              <ProPanelCard
+                title="签名"
+                hint={textLayers.length === 0 ? '这个模板没有文字图层' : '选中文字图层后可改内容与排版'}
+              >
+                {textLayers.length > 0 && (
+                  <>
+                    {textLayers.length > 1 && (
+                      <div className="flex flex-wrap" style={{ gap: 8, marginBottom: 12 }}>
+                        {textLayers.map(({ layer, realIdx }) => (
+                          <button key={realIdx} type="button"
+                            onClick={() => { setAlignTextIdx(realIdx); setAlignKind(null) }}
+                            style={{
+                              padding: '4px 10px',
+                              borderRadius: 999,
+                              fontSize: 12,
+                              cursor: 'pointer',
+                              border: `1px solid ${alignLayerIdx === realIdx ? 'var(--accent)' : 'var(--border-color)'}`,
+                              background: alignLayerIdx === realIdx ? 'var(--accent-bg)' : 'transparent',
+                              color: alignLayerIdx === realIdx ? 'var(--accent)' : 'var(--text-secondary)',
+                            }}>
+                            {layer.name || `文字 ${realIdx + 1}`}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {alignLayerIdx != null && alignLayer ? (
+                      <>
+                        <textarea
+                          value={editedTexts[alignLayerIdx] ?? alignLayer.text_content ?? ''}
+                          onFocus={() => setEditingTextIdx(alignLayerIdx)}
+                          onBlur={() => setEditingTextIdx(null)}
+                          onChange={e => setEditedTexts(prev => ({ ...prev, [alignLayerIdx]: e.target.value }))}
+                          placeholder="输入签名文字"
+                          rows={2}
+                          className="w-full outline-none resize-none"
+                          style={{
+                            minHeight: 64,
+                            padding: '12px 14px',
+                            borderRadius: 12,
+                            background: 'var(--bg-tertiary)',
+                            color: 'var(--text-primary)',
+                            border: `1px solid ${editingTextIdx === alignLayerIdx ? 'var(--accent)' : 'var(--border-color)'}`,
+                            fontSize: 14,
+                            lineHeight: '20px',
+                          }}
+                        />
+                        <div style={{ marginTop: 16, fontSize: 13, color: 'var(--text-primary)' }}>排版</div>
+                        <div className="flex" style={{ gap: 8, marginTop: 10 }}>
+                          {alignButtons.map(({ kind, patch }) => (
+                            <DesktopAlignButton key={kind} kind={kind} active={alignKind === kind} onClick={() => pickAlign(kind, patch)} />
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>点一下预览里的文字图层即可编辑</p>
+                    )}
+                  </>
+                )}
+              </ProPanelCard>
+
+              <ProPanelCard
+                title="颜色"
+                hint={pickerColorLayers.length === 0
+                  ? '这个模板没有可换色的图层'
+                  : (palette.length === 0 ? '上传图片后自动提取配色' : undefined)}
+              >
+                {palette.length > 0 && (
+                  <div className="flex flex-wrap items-center" style={{ gap: 10 }}>
+                    {palette.map(color => (
+                      <button key={color} type="button" onClick={() => setAllPickerColor(color)} title={color}
+                        style={{
+                          width: 28, height: 28, borderRadius: '50%', background: color, flexShrink: 0, cursor: 'pointer',
+                          border: paletteCurrent === color ? '2px solid var(--accent)' : '1px solid var(--border-color)',
+                          transform: paletteCurrent === color ? 'scale(1.1)' : undefined,
+                        }} />
+                    ))}
+                  </div>
+                )}
+                {pickerColorLayers.length > 0 && (
+                  <label className="flex items-center" style={{ marginTop: palette.length > 0 ? 14 : 0, height: 40, borderRadius: 12, background: 'var(--bg-tertiary)', padding: '0 14px', gap: 8, cursor: 'pointer' }}>
+                    <Palette className="w-4 h-4" style={{ color: 'var(--text-secondary)' }} />
+                    <span style={{ fontSize: 13, color: 'var(--text-primary)' }}>自定义颜色</span>
+                    <span style={{ marginLeft: 'auto', width: 22, height: 22, borderRadius: '50%', background: paletteCurrent || '#ffffff', border: '1px solid var(--border-color)' }} />
+                    <input
+                      type="color"
+                      value={paletteCurrent || '#ffffff'}
+                      onChange={(e) => setAllPickerColor(e.target.value)}
+                      className="sr-only"
+                    />
+                  </label>
+                )}
+              </ProPanelCard>
+            </div>
+
+            {/* 导出：固定在数据栏底部，滚动面板时不跟着滚走 */}
+            <button
+              type="button"
+              onClick={handleExport}
+              disabled={exporting || !hasUploadedImage}
+              className="poolux-btn poolux-btn-primary w-full flex-shrink-0"
+              style={{ minHeight: 46, fontSize: 15, opacity: exporting || !hasUploadedImage ? 0.5 : 1, boxShadow: 'none' }}
+            >
+              <Download className="w-4 h-4" />
+              {exporting ? '导出中…' : '导出图片'}
+            </button>
+          </aside>
+        </div>
+      </main>
+
+      {(msg || preparingImage) && (
+        <div className="fixed left-1/2 pointer-events-none" style={{
+          transform: 'translateX(-50%)',
+          bottom: 40,
+          zIndex: 60,
+          background: 'rgba(0,0,0,0.72)',
+          color: '#ffffff',
+          fontSize: 13,
+          padding: '8px 16px',
+          borderRadius: 999,
+          maxWidth: '80vw',
+        }}>
+          {preparingImage ? '正在处理图片…' : msg}
+        </div>
+      )}
+
+      {/* 导出成功弹窗（仅 Android 原生 App） */}
+      {saveSuccess && (
+        <div
+          className="fixed inset-0 flex items-center justify-center"
+          style={{ zIndex: 9998, background: 'rgba(0,0,0,0.35)' }}
+          onClick={() => setSaveSuccess(false)}
+        >
+          <div
+            className="flex flex-col items-center gap-3 px-8 py-6 rounded-2xl shadow-xl"
+            style={{
+              background: 'var(--bg-secondary)',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+              animation: 'fadeInScale 0.25s ease-out',
+              minWidth: 220,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              className="flex items-center justify-center rounded-full"
+              style={{
+                width: 56, height: 56,
+                background: 'linear-gradient(135deg, #34d399, #10b981)',
+                boxShadow: '0 4px 12px rgba(16,185,129,0.3)',
+              }}
+            >
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </div>
+            <div style={{ fontWeight: 600, fontSize: 16, color: 'var(--text-primary)' }}>
+              保存成功
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.4 }}>
+              已保存到相册「POOLUX」
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+
+  /* ═══════════════════════════════════════════════════════════
+     新版移动端界面（手环 Pro 系列）
+     布局取自 Figma 画板：顶栏 + 预览框 + 底部三个入口 + 底部抽屉
+     ═══════════════════════════════════════════════════════════ */
+  if (isProUi) return (
+    <div className={`h-dvh flex flex-col overflow-hidden relative${IS_OFFLINE ? ' safe-area-pad' : ''}`} style={{ background: PRO_PAGE_BG }}>
+      <div className="flex-1 flex flex-col min-h-0 w-full mx-auto" style={{ maxWidth: 430 }}>
+
+        {/* 顶栏：返回 / 模板名 / 导出。抽屉展开或预览全屏放大时整块淡出（设计稿里展开后的画板没有顶栏，
+            预览框上移后会盖到标题位置），留白高度不变，所以预览框的静置位置不会被顶栏带偏。 */}
+        <div
+          className="flex-shrink-0"
+          style={{
+            paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)',
+            opacity: activeSheet || previewExpanded ? 0 : 1,
+            transition: 'opacity 0.24s ease',
+            pointerEvents: activeSheet || previewExpanded ? 'none' : 'auto',
+          }}
+        >
+          <div className="flex items-center justify-between px-4">
+            {!IS_OFFLINE ? (
+              <Link to="/tools/watch-face" className="flex items-center justify-center" style={proStrokeStyle(44)}>
+                <ArrowLeft className="w-5 h-5" style={{ color: PRO_BUTTON_STROKE_COLOR }} />
+              </Link>
+            ) : (
+              <div style={{ width: 44, height: 44 }} />
+            )}
+            <div className="flex items-center" style={{ gap: 10 }}>
+              {/* 重置 / 删除当前图片：贴着导出按钮左侧排布。
+                  上传后常驻，不必先点中图层——否则这两个按钮会突然出现在预览框角上，很突兀。 */}
+              {hasUploadedImage && manageLayerIdx != null && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { hapticTick(); resetTransform(manageLayerIdx) }}
+                    className="flex items-center justify-center"
+                    title="恢复图片位置"
+                    style={proStrokeStyle(40)}
+                  >
+                    <RotateCcw className="w-4 h-4" style={{ color: PRO_BUTTON_STROKE_COLOR }} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { hapticTick(); clearImage(manageLayerIdx); setActiveLayerIdx(null) }}
+                    className="flex items-center justify-center"
+                    title="删除图片"
+                    style={proStrokeStyle(40)}
+                  >
+                    <Trash2 className="w-4 h-4" style={{ color: PRO_BUTTON_STROKE_COLOR }} />
+                  </button>
+                </>
+              )}
+              <button
+                onClick={handleExport}
+                disabled={exporting}
+                className="flex items-center justify-center transition-opacity"
+                style={{ ...proStrokeStyle(44), opacity: exporting ? 0.5 : 1 }}
+              >
+                <Download className="w-5 h-5" style={{ color: PRO_BUTTON_STROKE_COLOR }} />
+              </button>
+            </div>
+          </div>
+          <div className="text-center px-12" style={{ marginTop: 9 }}>
+            <div style={{ color: PRO_INK, fontSize: 24, fontWeight: 450, lineHeight: '32px' }}>{template.name}</div>
+            <div style={{ color: PRO_DIM_INK, fontSize: 12, lineHeight: '16px', marginTop: 4 }}>双指滑动以缩放平移</div>
+          </div>
+          {template.devices.length > 1 && (
+            <div className="flex justify-center flex-wrap" style={{ gap: 8, marginTop: 10 }}>
+              {template.devices.map((d, i) => (
+                <button
+                  key={i}
+                  onClick={() => setSelectedDeviceIdx(i)}
+                  style={{
+                    padding: '5px 12px',
+                    borderRadius: 999,
+                    fontSize: 12,
+                    border: `1px solid ${PRO_BUTTON_STROKE_COLOR}`,
+                    background: selectedDeviceIdx === i ? PRO_BUTTON_STROKE_COLOR : 'transparent',
+                    color: selectedDeviceIdx === i ? '#ffffff' : PRO_INK,
+                  }}
+                >
+                  {d.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* 预览区：左右内边距 = 设计稿的 56 - PAD，容器自带 PAD 的把手空间，正好复刻设计稿的留白 */}
+        <div
+          ref={previewWrapRef}
+          className="flex-1 min-h-0 flex items-center justify-center relative"
+          style={{ padding: `20px ${56 - PAD}px` }}
+          onClick={() => {
+            if (activeSheet) { setActiveSheet(null); return }
+            if (previewExpanded) setPreviewExpanded(false)
+          }}
+        >
+          {device ? (
+            <div
+              ref={previewBoxRef}
+              className="relative"
+              style={{
+                width: containerWidth,
+                height: containerHeight,
+                cursor: previewExpanded ? 'default' : curCursor,
+                // 抽屉展开 / 全屏放大都只走 transform：位移和缩放不参与布局，
+                // 所以预览框的尺寸不受动画影响，过渡也和抽屉上滑同一时长、同一曲线。
+                // 全屏时先按屏幕中心缩放（transform-origin 是中心），再补一段位移把中心挪到屏幕正中。
+                transform: previewExpanded
+                  ? `translate(${previewExpandShiftX}px, ${previewExpandShiftY}px) scale(${previewExpandScale})`
+                  : activeSheet
+                    ? `translateY(${-previewShiftY}px) scale(${previewSheetScale})`
+                    : 'translateY(0px) scale(1)',
+                transition: `transform ${PRO_SHEET_DURATION}s ${PRO_SHEET_EASING}`,
+              }}
+            >
+              <div className="absolute pointer-events-none" style={{
+                left: vpLeft - 1, top: vpTop - 1,
+                width: previewWidth + 2, height: previewHeight + 2,
+                borderRadius: cornerRadius + 1,
+                border: `1px solid ${PRO_HAIRLINE}`,
+                zIndex: 20,
+              }} />
+
+              <div
+                ref={containerRef}
+                className="absolute"
+                style={{ left: 0, top: 0, width: containerWidth, height: containerHeight, zIndex: 21 }}
+                onClick={(e) => {
+                  // 上一次 mouseup 已经切换过全屏预览（按下图片、松手时手已经偏出图层，
+                  // 于是 click 的落点变成容器本身）：这次 click 丢掉，否则会立刻又收回
+                  if (suppressPreviewClickRef.current) { suppressPreviewClickRef.current = false; return }
+                  if ((e.target as HTMLElement).closest('[data-interactive]')) return
+                  if (previewExpanded) { setPreviewExpanded(false); return }
+                  if (activeSheet) { setActiveSheet(null); return }
+                  if (activeLayerIdx !== null) { setActiveLayerIdx(null); return }
+                  const firstEmpty = interactiveLayers.find(({ realIdx }) => !layerStates[realIdx]?.imageUrl)
+                  if (firstEmpty) fileInputRefs.current[firstEmpty.realIdx]?.click()
+                }}
+                // 每次在空处按下都先把上一条抑制标记清掉，避免它残留下来吞掉后面的点击
+                onMouseDown={() => { suppressPreviewClickRef.current = false }}
+                onDragOver={(e) => { e.preventDefault(); setIsDragOver(true) }}
+                onDragLeave={() => setIsDragOver(false)}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  setIsDragOver(false)
+                  const file = e.dataTransfer.files?.[0]
+                  if (file && file.type.startsWith('image/')) {
+                    const target = interactiveLayers.find(({ realIdx }) => !layerStates[realIdx]?.imageUrl)
+                    if (target) handleFileUpload(target.realIdx, file)
+                  }
+                }}
+              >
+                {interactiveLayers.map(({ realIdx }) => (
+                  <input key={realIdx} ref={el => { fileInputRefs.current[realIdx] = el }}
+                    type="file" accept="image/*" className="hidden"
+                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileUpload(realIdx, f); e.target.value = '' }} />
+                ))}
+
+                <div className="absolute" style={{
+                  left: vpLeft,
+                  top: vpTop,
+                  width: previewWidth,
+                  height: previewHeight,
+                  borderRadius: cornerRadius,
+                  overflow: 'hidden',
+                  clipPath: `inset(0 round ${cornerRadius}px)`,
+                  WebkitClipPath: `inset(0 round ${cornerRadius}px)`,
+                }}>
+                  {/* 未上传图片时对齐设计稿「主页（未上传图片）」：预览框是一块比页面略深的半透明占位
+                      （设计稿节点 `用户端编辑预览框（未上传图片）`，无图片填充），
+                      既不画模板自己的底色，也不画模板里的文字/形状图层 ——
+                      否则模板里那块铺满画布的形状会直接看起来像「空预览框」，观感上和没改一样。
+                      页面底色改为白色后，这里用 6% 黑代替原来的 9% 白，才能保持「比页面深一点」的观感。 */}
+                  <div className="absolute inset-0" style={{ background: hasUploadedImage ? (device.background || '#FFFFFF') : 'rgba(0, 0, 0, 0.06)' }} />
+                  {hasUploadedImage && (
+                    <WatchFaceLayerStack
+                      device={device}
+                      sortedLayers={sortedLayers}
+                      previewScale={previewScale}
+                      layerStates={layerStates}
+                      pickedColor={pickedColor}
+                      editedTexts={editedTexts}
+                      imageFx={imageFxByLayer}
+                      textAlignOverrides={textAlignOverrides}
+                      backdropFilterOk={backdropFilterOk}
+                      dragMode={dragMode}
+                      activeLayerIdx={activeLayerIdx}
+                      onActivateLayer={setActiveLayerIdx}
+                      onLayerMouseDown={handleMouseDown}
+                      onLayerTouchStart={handleTouchStart}
+                      onRequestUpload={(realIdx) => fileInputRefs.current[realIdx]?.click()}
+                      onSelectText={(realIdx) => {
+                        // 全屏放大时点文字只是收回预览，不从这里钻进「签名」抽屉
+                        if (previewExpanded) { setPreviewExpanded(false); return }
+                        setEditingTextIdx(realIdx)
+                        setAlignTextIdx(realIdx)
+                        setAlignKind(null)
+                        setFxTab('text')
+                        setActiveSheet('fx')
+                        setEditedTexts(prev => ({ ...prev, [realIdx]: prev[realIdx] ?? device.layers[realIdx]?.text_content ?? '' }))
+                      }}
+                    />
+                  )}
+                  {/* 拖拽文件到预览框时给个落点提示（空白预览框里没有别的可见反馈） */}
+                  {!hasUploadedImage && isDragOver && (
+                    <div className="absolute inset-0 pointer-events-none" style={{ boxShadow: `inset 0 0 0 3px ${PRO_ACCENT}` }} />
+                  )}
+                </div>
+
+                {/* 缩放 / 旋转手柄（与旧版共用同一套坐标换算）。
+                    移动端不显示四角的缩放柄：手指会直接挡住那个小圆点，
+                    而且手机上有更顺手的双指手势（移动 + 缩放，见 handleTouchStart），
+                    所以这里统一用 md 断点只在桌面端显示，和下面的旋转柄保持一致。 */}
+                {(() => {
+                  const idx = activeLayerIdx ?? interactiveLayers.find(({ realIdx }) => layerStates[realIdx]?.imageUrl)?.realIdx
+                  if (idx == null) return null
+                  const st = layerStates[idx]
+                  if (!st?.imageUrl) return null
+                  const al = device.layers[idx]
+                  const acss = getLayerCss(al)
+                  const arect = resolveLayerRect(al, acss, device.width, device.height)
+                  const imageDisplay = getImageDisplay(idx)
+                  const imgW = imageDisplay?.dw ?? arect.w
+                  const imgH = imageDisplay?.dh ?? arect.h
+                  const cx = arect.w / 2 + (imageDisplay?.baseX ?? 0) + st.position.x
+                  const cy = arect.h / 2 + (imageDisplay?.baseY ?? 0) + st.position.y
+                  const hw = imgW / 2 * st.scale
+                  const hh = imgH / 2 * st.scale
+                  const rad = (st.rotation * Math.PI) / 180
+                  const cosA = Math.cos(rad), sinA = Math.sin(rad)
+                  const toPreview = (dx: number, dy: number) => ({
+                    x: vpLeft + (arect.left + dx) * previewScale,
+                    y: vpTop + (arect.top + dy) * previewScale,
+                  })
+                  return (['tl', 'tr', 'bl', 'br'] as const).map(corner => {
+                    let dx: number, dy: number
+                    if (corner === 'tl') { dx = -hw; dy = -hh }
+                    else if (corner === 'tr') { dx = hw; dy = -hh }
+                    else if (corner === 'bl') { dx = -hw; dy = hh }
+                    else { dx = hw; dy = hh }
+                    const devPx = cx + dx * cosA - dy * sinA
+                    const devPy = cy + dx * sinA + dy * cosA
+                    const p1 = toPreview(devPx, devPy)
+                    const mode = `scale-${corner}` as DragMode, rotMode = `rotate-${corner}` as DragMode
+                    const centerP = toPreview(cx, cy)
+                    const rdx = p1.x - centerP.x
+                    const rdy = p1.y - centerP.y
+                    const rlen = Math.sqrt(rdx * rdx + rdy * rdy) || 1
+                    const rpx = p1.x + (rdx / rlen) * ROT_HANDLE_OFFSET
+                    const rpy = p1.y + (rdy / rlen) * ROT_HANDLE_OFFSET
+                    return (
+                      <div key={corner} style={{ position: 'absolute', zIndex: 25 }} data-interactive="true">
+                        <svg className="hidden md:block absolute pointer-events-none" style={{ left: Math.min(p1.x, rpx) - 2, top: Math.min(p1.y, rpy) - 2, width: Math.abs(rpx - p1.x) + 4, height: Math.abs(rpy - p1.y) + 4, overflow: 'visible' }}>
+                          <line x1={p1.x - Math.min(p1.x, rpx) + 2} y1={p1.y - Math.min(p1.y, rpy) + 2} x2={rpx - Math.min(p1.x, rpx) + 2} y2={rpy - Math.min(p1.y, rpy) + 2} stroke="rgba(72,120,144,0.4)" strokeWidth="1.5" strokeDasharray="4 3" />
+                        </svg>
+                        <div className="hidden md:block absolute" style={{ left: p1.x - HANDLE_R, top: p1.y - HANDLE_R, width: HANDLE_R * 2, height: HANDLE_R * 2, borderRadius: '50%', background: PRO_ACCENT, border: '2.5px solid white', cursor: scaleCursor(mode), boxShadow: '0 2px 8px rgba(0,0,0,0.35)' }}
+                          onMouseDown={(e) => handleScaleMouseDown(idx, mode, e)} onTouchStart={(e) => handleScaleTouchStart(idx, mode, e)} />
+                        <div className="hidden md:block absolute" style={{ left: rpx - ROT_HANDLE_R, top: rpy - ROT_HANDLE_R, width: ROT_HANDLE_R * 2, height: ROT_HANDLE_R * 2, borderRadius: '50%', cursor: 'crosshair' }}
+                          onMouseDown={(e) => handleScaleMouseDown(idx, rotMode, e)} onTouchStart={(e) => handleScaleTouchStart(idx, rotMode, e)} />
+                        <svg className="hidden md:block absolute pointer-events-none" width="22" height="22" style={{ left: rpx - 11, top: rpy - 11 }} viewBox="0 0 24 24" fill="none">
+                          <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" fill={PRO_ACCENT} />
+                        </svg>
+                      </div>
+                    )
+                  })
+                })()}
+              </div>
+            </div>
+          ) : (
+            <p style={{ color: PRO_DIM_INK, fontSize: 14 }}>请先选择设备</p>
+          )}
+        </div>
+
+        {/* 底部占位：不管抽屉开合，这里始终按入口栏的高度留白。
+            预览区高度因此不会被抽屉挤动，预览框尺寸保持不变（设计稿展开前后都是 291×416）。 */}
+        <div className="flex-shrink-0" style={{ height: actionBarHeight || 108 }} aria-hidden="true" />
+      </div>
+
+      {/* 底部区域：入口按钮和抽屉叠在预览区之上（绝对定位，不参与上面的布局）。
+          容器本身不裁剪：抽屉收起时是「整体往下滑出屏幕」，靠外层根节点的 overflow 兜住，
+          容器跟着一起变矮的话会把还在下滑的面板从顶边切掉，看起来像被吃掉而不是滑走。
+          高度只在开合两态间切换，不参与动画，避免无意中挡住预览区的手势。 */}
+      <div
+        className="absolute left-0 right-0 bottom-0"
+        style={{
+          marginLeft: 'auto',
+          marginRight: 'auto',
+          maxWidth: 430,
+          zIndex: 40,
+          height: activeSheet ? sheetHeight : (actionBarHeight || 108),
+        }}
+      >
+          {/* 三个入口按钮：抽屉展开 / 预览全屏放大时淡出，收起时立刻显形。
+              收起时不再延迟：面板正从按钮底下滑走，按钮要一直在面板之上，
+              这样看到的是「面板钻到按钮下面去」，而不是面板原地渐变消失。 */}
+          <div
+            ref={actionBarRef}
+            className="absolute left-0 right-0 bottom-0 flex items-start justify-center"
+            style={{
+              zIndex: 2,
+              paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 30px)',
+              opacity: activeSheet || previewExpanded ? 0 : 1,
+              transition: 'opacity 0.16s ease',
+              pointerEvents: activeSheet || previewExpanded ? 'none' : 'auto',
+            }}
+          >
+            <ProActionButton
+              icon={<RiImageLine size={24} color={PRO_BUTTON_STROKE_COLOR} />}
+              label="上传图片"
+              onClick={handleProUpload}
+              disabled={interactiveLayers.length === 0}
+            />
+            {/* 设计稿 `Rectangle 2`：只在上传图片与取色之间有一条竖分割线 */}
+            <ProActionDivider />
+            <ProActionButton
+              icon={<RiDropperLine size={24} color={PRO_BUTTON_STROKE_COLOR} />}
+              label="取色"
+              onClick={() => { setActiveSheet('color'); setActiveLayerIdx(null) }}
+              disabled={pickerColorLayers.length === 0}
+            />
+            <div aria-hidden style={{ width: PRO_ACTION_GAP }} />
+            <ProActionButton
+              icon={<RiColorFilterLine size={24} color={PRO_BUTTON_STROKE_COLOR} />}
+              label="效果"
+              onClick={() => { setActiveSheet('fx'); setActiveLayerIdx(null) }}
+            />
+          </div>
+
+          {/* 抽屉：始终挂载，收起时整体平移到屏幕下方。
+              始终挂载有两个好处：收起动画有「上一帧位置」可过渡；第一次展开也能直接滑上来
+              （只在展开时才挂载的话，首帧没有起始位置，浏览器会直接跳到位、看不到动画）。 */}
+          <div
+            ref={sheetBoxRef}
+            className="absolute left-0 right-0 bottom-0"
+            aria-hidden={!activeSheet}
+            style={{
+              zIndex: 1,
+              transform: `translateY(${activeSheet ? 0 : sheetHeight}px)`,
+              transition: `transform ${PRO_SHEET_DURATION}s ${PRO_SHEET_EASING}`,
+              pointerEvents: activeSheet ? 'auto' : 'none',
+            }}
+          >
+              <ProSheet minHeight={PRO_SHEET_MIN_HEIGHT[sheetKindForLayout]} onClose={() => setActiveSheet(null)}>
+                {sheetKindForLayout === 'fx' ? (
+              <>
+                <div style={{ paddingTop: 25 }}>
+                  <ProSegmented<'image' | 'text'>
+                    value={fxTab}
+                    onChange={setFxTab}
+                    items={[{ value: 'image', label: '图片效果' }, { value: 'text', label: '签名' }]}
+                  />
+                </div>
+                {/* 两个面板叠在同一个网格单元里、始终挂载：切换时靠 translateX 左右平移，
+                    进来的从一侧推入、出去的从另一侧退出，和分段控件底块的移动方向一致。
+                    始终挂载还顺带解决了滑杆的另一个毛病：面板重挂载会让 ProFxSlider 先按
+                    兜底宽度画一帧、量到真实宽度后再跳一下（「位移一下」的来源）。 */}
+                <div style={{ display: 'grid', overflow: 'hidden' }}>
+                  <div
+                    aria-hidden={fxTab !== 'image'}
+                    style={{
+                      gridArea: '1 / 1',
+                      padding: '0 30px',
+                      transform: `translateX(${fxTab === 'image' ? 0 : -100}%)`,
+                      // 平移之外再加一层淡入淡出：只靠平移、两块内容又都是灰底滑杆时，
+                      // 边界会显得很硬；淡淡地交叠一下，切换看起来才是「换页」而不是「硬切」
+                      opacity: fxTab === 'image' ? 1 : 0,
+                      transition: `transform ${PRO_TAB_DURATION}s ${PRO_TAB_EASING}, opacity ${PRO_TAB_DURATION}s ${PRO_TAB_EASING}`,
+                    }}
+                  >
+                    <ProFxSlider
+                      label="对比度" value={toSigned(imageFx.contrast ?? 100)} min={-100} max={100} step={1}
+                      display={formatSigned(Math.round(toSigned(imageFx.contrast ?? 100)))} centerOrigin
+                      onChange={(v) => setImageFx(prev => ({ ...prev, contrast: toPercent(v) }))}
+                    />
+                    <ProFxSlider
+                      label="模糊度" value={imageFx.blur ?? 0} min={0} max={blurMax} step={1}
+                      display={`${Math.round(imageFx.blur ?? 0)}px`} centerOrigin={false}
+                      onChange={(v) => setImageFx(prev => ({ ...prev, blur: v }))}
+                    />
+                    <ProFxSlider
+                      label="饱和度" value={toSigned(imageFx.saturation ?? 100)} min={-100} max={100} step={1}
+                      display={formatSigned(Math.round(toSigned(imageFx.saturation ?? 100)))} centerOrigin
+                      onChange={(v) => setImageFx(prev => ({ ...prev, saturation: toPercent(v) }))}
+                    />
+                  </div>
+                  <div
+                    aria-hidden={fxTab !== 'text'}
+                    style={{
+                      gridArea: '1 / 1',
+                      padding: '0 18px',
+                      transform: `translateX(${fxTab === 'text' ? 0 : 100}%)`,
+                      opacity: fxTab === 'text' ? 1 : 0,
+                      transition: `transform ${PRO_TAB_DURATION}s ${PRO_TAB_EASING}, opacity ${PRO_TAB_DURATION}s ${PRO_TAB_EASING}`,
+                    }}
+                  >
+                    <div style={{ marginTop: 12, color: PRO_INK, fontSize: 16, fontWeight: 450, lineHeight: '21px' }}>签名</div>
+                    {textLayers.length > 1 && (
+                      <div className="flex flex-wrap" style={{ gap: 8, marginTop: 10 }}>
+                        {textLayers.map(({ layer, realIdx }) => (
+                          <button
+                            key={realIdx}
+                            onClick={() => { setAlignTextIdx(realIdx); setAlignKind(null) }}
+                            style={{
+                              padding: '4px 10px',
+                              borderRadius: 999,
+                              fontSize: 12,
+                              border: `1px solid ${alignLayerIdx === realIdx ? PRO_ACCENT : PRO_BUTTON_STROKE_COLOR}`,
+                              background: alignLayerIdx === realIdx ? PRO_ACCENT : 'transparent',
+                              color: alignLayerIdx === realIdx ? '#ffffff' : PRO_INK,
+                            }}
+                          >
+                            {layer.name || `文字 ${realIdx + 1}`}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {alignLayerIdx != null && alignLayer ? (
+                      <>
+                        <textarea
+                          value={editedTexts[alignLayerIdx] ?? alignLayer.text_content ?? ''}
+                          onFocus={() => setEditingTextIdx(alignLayerIdx)}
+                          onBlur={() => setEditingTextIdx(null)}
+                          onChange={e => setEditedTexts(prev => ({ ...prev, [alignLayerIdx]: e.target.value }))}
+                          placeholder="输入签名文字"
+                          className="pro-sign-textarea"
+                          style={{
+                            marginTop: 15,
+                            width: '100%',
+                            height: 61,
+                            borderRadius: 20,
+                            background: 'rgba(0,0,0,0.10)',
+                            border: 'none',
+                            outline: 'none',
+                            // 全局 `textarea:focus` 会加一圈主题色光晕，这里按设计去掉
+                            boxShadow: 'none',
+                            resize: 'none',
+                            padding: '20px 16px',
+                            fontSize: 16,
+                            lineHeight: '21px',
+                            color: PRO_INK,
+                          }}
+                        />
+                        <div style={{ marginTop: 21, color: PRO_INK, fontSize: 16, fontWeight: 450, lineHeight: '21px' }}>排版</div>
+                        <div className="flex justify-between" style={{ marginTop: 15, gap: 12 }}>
+                          {alignButtons.map(({ kind, patch }) => (
+                            <ProAlignButton
+                              key={kind}
+                              kind={kind}
+                              active={alignKind === kind}
+                              onClick={() => pickAlign(kind, patch)}
+                            />
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <p style={{ marginTop: 15, fontSize: 13, color: 'rgba(19,19,19,0.55)' }}>这个模板没有文字图层</p>
+                    )}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div style={{ padding: '0 30px' }}>
+                <div style={{ marginTop: 35, color: PRO_INK, fontSize: 16, fontWeight: 450, lineHeight: '21px' }}>颜色</div>
+                {palette.length > 0 ? (
+                  <div className="flex justify-between" style={{ marginTop: 14 }}>
+                    {palette.map(color => (
+                      <button
+                        key={color}
+                        onClick={() => setAllPickerColor(color)}
+                        style={{
+                          width: 26,
+                          height: 26,
+                          borderRadius: 20,
+                          background: color,
+                          flexShrink: 0,
+                          border: paletteCurrent === color ? `2px solid ${PRO_ACCENT}` : '1px solid rgba(0,0,0,0.12)',
+                          transform: paletteCurrent === color ? 'scale(1.12)' : undefined,
+                        }}
+                        title={color}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <p style={{ marginTop: 14, fontSize: 13, color: 'rgba(19,19,19,0.55)' }}>上传图片后自动提取配色</p>
+                )}
+                <label className="flex items-center" style={{ marginTop: 26, height: 44, borderRadius: 22, background: 'rgba(0,0,0,0.08)', padding: '0 16px', gap: 8, cursor: 'pointer' }}>
+                  <Palette className="w-4 h-4" style={{ color: PRO_INK }} />
+                  <span style={{ color: PRO_INK, fontSize: 14 }}>自定义颜色</span>
+                  <span style={{ marginLeft: 'auto', width: 22, height: 22, borderRadius: 11, background: paletteCurrent || '#ffffff', border: '1px solid rgba(0,0,0,0.15)' }} />
+                  <input
+                    type="color"
+                    value={paletteCurrent || '#ffffff'}
+                    onChange={(e) => setAllPickerColor(e.target.value)}
+                    className="sr-only"
+                  />
+                </label>
+                </div>
+                )}
+              </ProSheet>
+          </div>
+      </div>
+
+      {(msg || preparingImage) && (
+        <div className="fixed left-1/2 pointer-events-none" style={{
+          transform: 'translateX(-50%)',
+          bottom: 'calc(env(safe-area-inset-bottom, 0px) + 150px)',
+          zIndex: 60,
+          background: 'rgba(0,0,0,0.72)',
+          color: '#ffffff',
+          fontSize: 13,
+          padding: '8px 16px',
+          borderRadius: 999,
+          maxWidth: '80vw',
+        }}>
+          {preparingImage ? '正在处理图片…' : msg}
+        </div>
+      )}
+
+      {/* 导出成功弹窗（仅 Android 原生 App） */}
+      {saveSuccess && (
+        <div
+          className="fixed inset-0 flex items-center justify-center"
+          style={{ zIndex: 9998, background: 'rgba(0,0,0,0.35)' }}
+          onClick={() => setSaveSuccess(false)}
+        >
+          <div
+            className="flex flex-col items-center gap-3 px-8 py-6 rounded-2xl shadow-xl"
+            style={{
+              background: 'var(--bg-secondary)',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+              animation: 'fadeInScale 0.25s ease-out',
+              minWidth: 220,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              className="flex items-center justify-center rounded-full"
+              style={{
+                width: 56, height: 56,
+                background: 'linear-gradient(135deg, #34d399, #10b981)',
+                boxShadow: '0 4px 12px rgba(16,185,129,0.3)',
+              }}
+            >
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </div>
+            <div style={{ fontWeight: 600, fontSize: 16, color: 'var(--text-primary)' }}>
+              保存成功
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.4 }}>
+              已保存到相册「POOLUX」
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 
@@ -1965,339 +2980,29 @@ export function TemplateEditor() {
                               WebkitClipPath: `inset(0 round ${cornerRadius}px)`,
                             }}>
                               <div className="absolute inset-0" style={{ background: device.background || '#FFFFFF' }} />
-                              <div style={{ width: device.width, height: device.height, transform: `scale(${previewScale})`, transformOrigin: 'top left', position: 'relative', willChange: 'transform' }}>
-                                {sortedLayers.map(({ layer, realIdx }, sortIdx) => {
-                                  const isInteractive = (layer.type === 'image' || layer.type === 'svg' || layer.type === 'shape')
-                                    && layer.allow_user_upload
-                                  const state = layerStates[realIdx]
-                                  const css = getLayerCss(layer)
-                                  // 背景模糊效果
-                                  const fx = layer.effects
-                                  const backdropBlur = fx && fx.blur_type === 'backdrop' && fx.blur_value > 0 ? fx.blur_value : 0
-                                  const fxOpacity = fx && fx.opacity < 100 ? fx.opacity / 100 : undefined
-                                  // Android/HyperOS 必须完全省略 backdrop-filter；仅改变背景色仍会触发黑色 GPU 纹理。
-                                  const backdropFilterStyle: React.CSSProperties = backdropFilterOk
-                                    ? { backdropFilter: `blur(${backdropBlur}px)`, WebkitBackdropFilter: `blur(${backdropBlur}px)` }
-                                    : {}
-                                  const backdropFallbackBg = backdropFilterOk ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.22)'
-                                  if (!isInteractive) {
-                                    // ── 非交互图层：SVG / Shape / Color / Static Image ──
-                                    if (layer.type === 'svg') {
-                                      const style = getLayerBoxStyle(layer, css, device.width, device.height)
-                                      const svgColor = layer.color_mode === 'picker' ? pickedColor[realIdx] : layer.color
-                                      const svgBoxShadow = css['box-shadow'] || css['boxShadow']
-                                      const renderedSvg = fitSvgToContainer(
-                                        layer.color_mode === 'picker' ? applySvgColor(layer.css_code || '', svgColor) : layer.css_code || '',
-                                      )
-                                      return (
-                                        <div key={sortIdx} style={{ ...style, overflow: 'hidden', color: svgColor, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), boxShadow: svgBoxShadow, pointerEvents: 'none' }}>
-                                          {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
-                                          )}
-                                          <div style={{ position: 'relative', zIndex: 1, width: '100%', height: '100%' }} dangerouslySetInnerHTML={{ __html: renderedSvg }} />
-                                        </div>
-                                      )
-                                    }
-                                    if (layer.type === 'shape') {
-                                      const style = getLayerBoxStyle(layer, css, device.width, device.height)
-                                      // 原始 CSS 兜底：绕过 CSSOM 浏览器差异，确保渐变和边框一定出现
-                                      const rawShapeProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
-                                      const rawGradient = rawShapeProps['background'] || rawShapeProps['background-image'] || ''
-                                      if (rawGradient && rawGradient !== 'none' && /gradient\(/.test(rawGradient) && !(style as any).backgroundImage && !(style as any).background) {
-                                        (style as any).backgroundImage = rawGradient
-                                      }
-                                      const rawBorderVal = rawShapeProps['border'] || ''
-                                      if (rawBorderVal && rawBorderVal !== 'none' && !style.border && !style.borderTopWidth) {
-                                        style.border = rawBorderVal
-                                      }
-                                      // DEBUG: shape 预览诊断
-                                      if (rawGradient || rawBorderVal) {
-                                        console.log('[Preview DEBUG] shape层', {
-                                          realIdx,
-                                          type: layer.type,
-                                          cssBgKeys: Object.keys(css).filter(k => k.includes('background') || k.includes('border')),
-                                          styleBgImage: (style as any).backgroundImage,
-                                          styleBackground: (style as any).background,
-                                          styleBorder: (style as any).border,
-                                          styleBorderTopWidth: (style as any).borderTopWidth,
-                                          rawGradient,
-                                          rawBorderVal,
-                                        })
-                                      }
-                                      if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) style.backgroundColor = layer.color
-                                      if (layer.color_mode === 'picker' && pickedColor[realIdx]) {
-                                        const bgGradient = (css['background'] || css['background-color'] || css['background-image'] || css.backgroundColor || '').includes('gradient(')
-                                        if (!bgGradient) style.backgroundColor = pickedColor[realIdx]
-                                      }
-                                      return (
-                                        <div key={sortIdx} style={{ ...style, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), pointerEvents: 'none' }}>
-                                          {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
-                                          )}
-                                        </div>
-                                      )
-                                    }
-                                    if (layer.type === 'text') {
-                                      const displayText = editedTexts[realIdx] ?? layer.text_content ?? ''
-                                      const textStyle = resolveTextStyle(layer, device.width, device.height)
-                                      const justifyContent = textStyle.verticalAlign === 'middle' ? 'center' : textStyle.verticalAlign === 'bottom' ? 'flex-end' : 'flex-start'
-                                      const textBoxStyle: React.CSSProperties = {
-                                        ...textStyle.explicitStyle,
-                                        position: 'absolute',
-                                        left: textStyle.left,
-                                        top: textStyle.top,
-                                        width: textStyle.width,
-                                        height: textStyle.height,
-                                        display: 'flex',
-                                        flexDirection: 'column',
-                                        justifyContent,
-                                        fontSize: textStyle.fontSize,
-                                        fontFamily: textStyle.fontFamily,
-                                        fontWeight: textStyle.fontWeight,
-                                        fontStyle: textStyle.fontStyle,
-                                        lineHeight: `${textStyle.lineHeightPx}px`,
-                                        letterSpacing: textStyle.letterSpacingPx,
-                                        color: textStyle.color,
-                                        textAlign: textStyle.textAlign,
-                                        whiteSpace: 'pre-wrap',
-                                        wordBreak: 'break-word',
-                                        ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}),
-                                        cursor: 'text',
-                                        zIndex: 50,
-                                      }
-                                      return (
-                                        <div key={sortIdx} style={textBoxStyle}
-                                          onClick={(e) => { e.stopPropagation(); setEditingTextIdx(realIdx); setEditedTexts(prev => ({ ...prev, [realIdx]: prev[realIdx] ?? layer.text_content ?? '' })) }}>
-                                          {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: '-4px', ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0 }} />
-                                          )}
-                                          <span style={{ position: 'relative', zIndex: 1, width: '100%', pointerEvents: 'none', outline: editingTextIdx === realIdx ? '1px solid var(--accent)' : undefined, outlineOffset: 2 }}>
-                                            {displayText || <span style={{ opacity: 0.4 }}>点击后在设备下方编辑文字</span>}
-                                          </span>
-                                        </div>
-                                      )
-                                    }
-                                    if (layer.type === 'color') {
-                                      const cpVal = getClipPath(css)
-                                      if (cpVal) {
-                                        const rect = resolveLayerRect(layer, css, device.width, device.height)
-                                        const clipPts = parseClipPathToPoints(cpVal, rect.w, rect.h)
-                                        if (clipPts) {
-                                          const boxStyle2 = cssToProps(css) as Record<string, unknown>
-                                          const bgColor2 = (boxStyle2.backgroundColor as string) || ''
-                                          const rawProps2 = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
-                                          const rawBg2 = rawProps2['background'] || rawProps2['background-image'] || ''
-                                          const bgImage2 = (boxStyle2.backgroundImage as string) || (boxStyle2.background as string) || rawBg2 || css['background-image'] || ''
-                                          const isGradient2 = bgImage2 !== 'none' && /gradient\(/.test(bgImage2)
+                              <WatchFaceLayerStack
+                                device={device}
+                                sortedLayers={sortedLayers}
+                                previewScale={previewScale}
+                                layerStates={layerStates}
+                                pickedColor={pickedColor}
+                                editedTexts={editedTexts}
+                                backdropFilterOk={backdropFilterOk}
+                                dragMode={dragMode}
+                                activeLayerIdx={activeLayerIdx}
+                                onActivateLayer={setActiveLayerIdx}
+                                onLayerMouseDown={handleMouseDown}
+                                onLayerTouchStart={handleTouchStart}
+                                onRequestUpload={(realIdx) => fileInputRefs.current[realIdx]?.click()}
+                                onSelectText={(realIdx) => {
+                                  setEditingTextIdx(realIdx)
+                                  setEditedTexts(prev => ({ ...prev, [realIdx]: prev[realIdx] ?? device.layers[realIdx]?.text_content ?? '' }))
+                                }}
+                              />
 
-                                          // DEBUG: clip-path color 预览诊断
-                                          if (rawBg2 || (layer.css_code || '').includes('gradient(') || (layer.css_position_code || '').includes('gradient(')) {
-                                            console.log('[Preview DEBUG] clip-path color层', {
-                                              realIdx,
-                                              cssBgImage: css['background-image'],
-                                              cssBackground: css['background'],
-                                              boxStyleBgImage: boxStyle2.backgroundImage,
-                                              boxStyleBackground: boxStyle2.background,
-                                              boxStyleBgColor: boxStyle2.backgroundColor,
-                                              rawBg2,
-                                              bgImage2,
-                                              isGradient2,
-                                            })
-                                          }
-
-                                          let fillColor: string
-                                          if (isGradient2) {
-                                            fillColor = bgImage2
-                                          } else if (bgColor2 && bgColor2 !== 'rgba(0, 0, 0, 0)') {
-                                            fillColor = bgColor2
-                                          } else if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) {
-                                            fillColor = layer.color
-                                          } else {
-                                            fillColor = '#000'
-                                          }
-
-                                          if (layer.color_mode === 'picker' && pickedColor[realIdx] && !fillColor.includes('gradient(')) fillColor = pickedColor[realIdx]
-                                          return <svg key={sortIdx} style={{ position: 'absolute', left: rect.left, top: rect.top, width: rect.w, height: rect.h, overflow: 'visible', ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), pointerEvents: 'none' }}><polygon points={pointsToSvgAttr(clipPts)} fill={fillColor} /></svg>
-                                        }
-                                      }
-                                      const style = getLayerBoxStyle(layer, css, device.width, device.height)
-                                      // 原始 CSS 兜底渐变和边框
-                                      const rawColorProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
-                                      const rawGrad = rawColorProps['background'] || rawColorProps['background-image'] || ''
-                                      if (rawGrad && rawGrad !== 'none' && /gradient\(/.test(rawGrad) && !(style as any).backgroundImage && !(style as any).background) {
-                                        (style as any).backgroundImage = rawGrad
-                                      }
-                                      const rawBdr = rawColorProps['border'] || ''
-                                      if (rawBdr && rawBdr !== 'none' && !style.border && !style.borderTopWidth) {
-                                        style.border = rawBdr
-                                      }
-                                      // DEBUG: color 预览诊断
-                                      if (rawGrad || rawBdr) {
-                                        console.log('[Preview DEBUG] color层', {
-                                          realIdx,
-                                          type: layer.type,
-                                          cssBgKeys: Object.keys(css).filter(k => k.includes('background') || k.includes('border')),
-                                          styleBgImage: (style as any).backgroundImage,
-                                          styleBackground: (style as any).background,
-                                          styleBorder: (style as any).border,
-                                          styleBorderTopWidth: (style as any).borderTopWidth,
-                                          rawGrad,
-                                          rawBdr,
-                                        })
-                                      }
-                                      if (layer.color_mode === 'picker' && pickedColor[realIdx]) {
-                                        const bgGradient = (css['background'] || css['background-color'] || css['background-image'] || css.backgroundColor || '').includes('gradient(')
-                                        if (!bgGradient) style.backgroundColor = pickedColor[realIdx]
-                                      }
-                                      else if (layer.color && !css['background'] && !css['background-color'] && !css.backgroundColor) style.backgroundColor = layer.color
-                                      return (
-                                        <div key={sortIdx} style={{ ...style, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), pointerEvents: 'none' }}>
-                                          {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
-                                          )}
-                                        </div>
-                                      )
-                                    }
-                                    if (layer.type === 'image' && layer.show_on_client === false) return null
-                                    if (layer.type === 'image' && layer.image_url) {
-                                      const style = getLayerBoxStyle(layer, css, device.width, device.height)
-                                      const imageFit = typeof style.objectFit === 'string' ? style.objectFit : 'fill'
-                                      const imagePosition = typeof style.objectPosition === 'string' ? style.objectPosition : '50% 50%'
-                                      return (
-                                        <div key={sortIdx} style={{ ...style, ...(fxOpacity !== undefined ? { opacity: fxOpacity } : {}), overflow: 'hidden', pointerEvents: 'none' }}>
-                                          {backdropBlur > 0 && (
-                                            <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 1, borderRadius: 'inherit' }} />
-                                          )}
-                                          <img src={layer.image_url} alt="" draggable={false} style={{
-                                            width: '100%',
-                                            height: '100%',
-                                            objectFit: imageFit,
-                                            objectPosition: imagePosition,
-                                            pointerEvents: 'none',
-                                            maxWidth: 'none',
-                                            display: 'block',
-                                            position: 'relative',
-                                            zIndex: 2,
-                                            transform: `rotate(${layer.adjustments?.rotation ?? 0}deg) scale(${layer.adjustments?.scale ?? 1})`,
-                                            filter: resolveImageFilter(layer),
-                                            WebkitFilter: resolveImageFilter(layer),
-                                            willChange: 'transform, filter',
-                                            backfaceVisibility: 'hidden',
-                                          }} />
-                                        </div>
-                                      )
-                                    }
-                                    return null
-                                  }
-                                  const rect = resolveLayerRect(layer, css, device.width, device.height)
-                                  const cssW = rect.w
-                                  const cssH = rect.h
-                                  const cssLeft = rect.left
-                                  const cssTop = rect.top
-                                  // 从 CSS 提取边框圆角和阴影
-                                  const cssBorderRadius = resolveBorderRadius(css)
-                                  const cssBoxShadow = css['box-shadow'] || css['boxShadow']
-                                  const isInsetBoxShadow = /\binset\b/i.test(cssBoxShadow || '')
-                                  const layerOpacity = parseFloat(css['opacity'] || '1')
-                                  const interactiveStyle = getLayerBoxStyle(layer, css, device.width, device.height)
-                                  if (layer.type === 'shape') {
-                                    const rawShapeProps = { ...getRawCssProps(layer.css_code || ''), ...getRawCssProps(layer.css_position_code || '') }
-                                    const rawGradient = rawShapeProps['background'] || rawShapeProps['background-image'] || ''
-                                    if (rawGradient && rawGradient !== 'none' && /gradient\(/.test(rawGradient) && !interactiveStyle.backgroundImage && !interactiveStyle.background) {
-                                      interactiveStyle.backgroundImage = rawGradient
-                                    }
-                                    const rawBorder = rawShapeProps.border || ''
-                                    if (rawBorder && rawBorder !== 'none' && !interactiveStyle.border && !interactiveStyle.borderTopWidth) {
-                                      interactiveStyle.border = rawBorder
-                                    }
-                                    const hasGradient = String(
-                                      interactiveStyle.backgroundImage || interactiveStyle.background || rawGradient || css['background-image'] || css.background || '',
-                                    ).includes('gradient(')
-                                    if (layer.color_mode === 'picker' && pickedColor[realIdx] && !hasGradient) {
-                                      interactiveStyle.backgroundColor = pickedColor[realIdx]
-                                    } else if (layer.color && !css.background && !css['background-color'] && !css.backgroundColor) {
-                                      interactiveStyle.backgroundColor = layer.color
-                                    }
-                                  }
-                                  const hasVisualContent = Boolean(
-                                    state?.imageUrl
-                                    || (layer.show_on_client !== false && layer.image_url)
-                                    || layer.type === 'shape',
-                                  )
-
-                                  const displayRect = state?.naturalWidth && state.naturalHeight
-                                    ? resolveImageDrawRect(
-                                        state.naturalWidth,
-                                        state.naturalHeight,
-                                        { left: 0, top: 0, width: cssW, height: cssH },
-                                        resolveUserImageFit(css['object-fit']),
-                                        css['object-position'],
-                                      )
-                                    : { left: 0, top: 0, width: cssW, height: cssH }
-
-                                  return (
-                                    <div key={sortIdx} data-interactive="true"
-                                      style={{ ...interactiveStyle, zIndex: layer.z_index ?? 0, opacity: hasVisualContent ? layerOpacity : 0, cursor: state?.imageUrl ? (dragMode === 'move' ? 'grabbing' : 'grab') : 'pointer', pointerEvents: hasVisualContent ? 'auto' : 'none', borderRadius: cssBorderRadius, clipPath: getRoundedClipPath(cssBorderRadius), WebkitClipPath: getRoundedClipPath(cssBorderRadius), boxShadow: isInsetBoxShadow ? undefined : cssBoxShadow, touchAction: 'none', overflow: 'hidden', willChange: 'transform' }}
-                                      onMouseDown={(e) => { if (state?.imageUrl) { setActiveLayerIdx(realIdx); handleMouseDown(realIdx, e) } }}
-                                      onTouchStart={(e) => { if (state?.imageUrl) { setActiveLayerIdx(realIdx); handleTouchStart(realIdx, e) } }}
-                                      onClick={(e) => { e.stopPropagation(); if (!state?.imageUrl) fileInputRefs.current[realIdx]?.click() }}>
-                                      <div style={{ width: '100%', height: '100%', overflow: 'hidden', borderRadius: 'inherit', position: 'relative' }}>
-                                      {/* 背景模糊 overlay */}
-                                      {backdropBlur > 0 && (
-                                        <div style={{ position: 'absolute', inset: 0, ...backdropFilterStyle, background: backdropFallbackBg, pointerEvents: 'none', zIndex: 0, borderRadius: 'inherit' }} />
-                                      )}
-                                      {state?.imageUrl ? (
-                                        <div style={{
-                                          width: displayRect.width,
-                                          height: displayRect.height,
-                                          position: 'absolute',
-                                          left: displayRect.left,
-                                          top: displayRect.top,
-                                          pointerEvents: 'none',
-                                          transform: `translate(${state.position.x}px, ${state.position.y}px) rotate(${state.rotation}deg) scale(${state.scale})`,
-                                          transformOrigin: 'center center',
-                                          zIndex: 1,
-                                          filter: resolveImageFilter(layer),
-                                          WebkitFilter: resolveImageFilter(layer),
-                                          willChange: 'transform, filter',
-                                          backfaceVisibility: 'hidden',
-                                        }}>
-                                          <img src={state.imageUrl} alt="" draggable={false} style={{
-                                            width: '100%',
-                                            height: '100%',
-                                            maxWidth: 'none',
-                                            display: 'block',
-                                            pointerEvents: 'none',
-                                          }} />
-                                        </div>
-                                      ) : layer.show_on_client !== false && layer.image_url ? (
-                                        <img src={layer.image_url} alt="" draggable={false} style={{
-                                          width: '100%',
-                                          height: '100%',
-                                          maxWidth: 'none',
-                                          objectFit: (css['object-fit'] || 'fill') as React.CSSProperties['objectFit'],
-                                          objectPosition: css['object-position'] || '50% 50%',
-                                          pointerEvents: 'none',
-                                          position: 'relative',
-                                          zIndex: 1,
-                                          transform: `rotate(${layer.adjustments?.rotation ?? 0}deg) scale(${layer.adjustments?.scale ?? 1})`,
-                                          filter: resolveImageFilter(layer),
-                                          WebkitFilter: resolveImageFilter(layer),
-                                          willChange: 'transform, filter',
-                                          backfaceVisibility: 'hidden',
-                                        }} />
-                                      ) : null}
-                                      {isInsetBoxShadow && (
-                                        <div style={{ position: 'absolute', inset: 0, borderRadius: 'inherit', boxShadow: cssBoxShadow, pointerEvents: 'none', zIndex: 2 }} />
-                                      )}
-                                      </div>
-                                    </div>
-                                  )
-                                })}
-                              </div>
                             </div>
 
-                            {/* 缩放/旋转手柄 — 始终显示在有图片的交互图层上（与 WatchFaceEdit 一致） */}
+                            {/* 缩放/旋转手柄 — 始终显示在有图片的交互图层上 */}
                             {(() => {
                               const idx = activeLayerIdx ?? interactiveLayers.find(({realIdx}) => layerStates[realIdx]?.imageUrl)?.realIdx
                               if (idx == null) return null
@@ -2454,7 +3159,7 @@ export function TemplateEditor() {
 
                 {device && pickerColorLayers.some(({ realIdx }) => pickerColors[realIdx]?.length > 0) && (
                   <div className="rounded-xl p-4 lg:p-5" style={{ background: 'var(--bg-secondary)', boxShadow: 'var(--shadow-card)', border: '1px solid var(--border-color)' }}>
-                    <h3 className="text-sm lg:text-base font-semibold mb-3" style={{ color: 'var(--text-primary)' }}>主题颜色（所有图层统一）</h3>
+                    <h3 className="text-sm lg:text-base font-semibold mb-3" style={{ color: 'var(--text-primary)' }}>主题颜色</h3>
                     {/* 取第一个有颜色数据的 picker 图层作为色板来源 */}
                     {(() => {
                       const firstPicker = pickerColorLayers.find(({ realIdx }) => pickerColors[realIdx]?.length > 0)
@@ -2504,8 +3209,8 @@ export function TemplateEditor() {
                   </button>
                 )}
 
-                {msg && (
-                  <div className="text-xs text-center py-1" style={{ color: 'var(--accent)' }}>{msg}</div>
+                {(msg || preparingImage) && (
+                  <div className="text-xs text-center py-1" style={{ color: 'var(--accent)' }}>{preparingImage ? '正在处理图片…' : msg}</div>
                 )}
               </div>
             </div>

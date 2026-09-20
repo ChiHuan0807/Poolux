@@ -38,7 +38,7 @@ input[type="number"] {
 
 /* ========== CSS 变量 — Poolux 新官网风格 ========== */
 :root {
-  --bg-primary: #f9f9f9;
+  --bg-primary: #ffffff;
   --bg-secondary: #ffffff;
   --bg-tertiary: #f1f1f4;
   --bg-hover: rgba(61, 61, 61, 0.04);
@@ -56,7 +56,7 @@ input[type="number"] {
   --accent-bg-hover: rgba(115, 139, 229, 0.16);
   --gradient-accent: linear-gradient(135deg, #738be5 0%, #8ea0ec 100%);
   --gradient-accent-hover: linear-gradient(135deg, #5b71d0 0%, #738be5 100%);
-  --navbar-bg: rgba(249, 249, 249, 0.88);
+  --navbar-bg: rgba(255, 255, 255, 0.88);
   --danger: #FF3B30;
   --success: #34C759;
   --warning: #FF9500;
@@ -64,6 +64,11 @@ input[type="number"] {
   --shadow-elevated: 0 4px 18px rgba(34, 34, 34, 0.08), 0 1px 4px rgba(34, 34, 34, 0.04);
   --shadow-dropdown: 0 10px 30px rgba(34, 34, 34, 0.1), 0 2px 8px rgba(34, 34, 34, 0.05);
   --frame-border: #c8c8cd;
+  /* 桌面端 Pro 编辑器（数据栏滑杆）的轨道与中点刻度。
+     移动端抽屉是纯白页面，轨道写死 rgba(0,0,0,0.13)；桌面端要跟着站点深浅色走，
+     所以抽成变量：浅色取同一个色号，深色换成白色叠加的等效灰度。 */
+  --pro-fx-track: rgba(0, 0, 0, 0.13);
+  --pro-fx-notch: rgba(0, 0, 0, 0.32);
   --radius-sm: 8px;
   --radius-md: 12px;
   --radius-lg: 16px;
@@ -96,6 +101,8 @@ input[type="number"] {
   --shadow-elevated: 0 4px 18px rgba(0, 0, 0, 0.36), 0 1px 4px rgba(0, 0, 0, 0.2);
   --shadow-dropdown: 0 10px 30px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.28);
   --frame-border: #E5E5EA;
+  --pro-fx-track: rgba(255, 255, 255, 0.16);
+  --pro-fx-notch: rgba(255, 255, 255, 0.30);
   --navbar-bg: rgba(22, 22, 24, 0.88);
 }
 
@@ -164,7 +171,7 @@ body {
 /* ========== 全站顶栏（与官网首页同一视觉） ========== */
 .site-header-root {
   --sh-ink: var(--text-primary, #3d3d3d);
-  --sh-canvas: var(--bg-primary, #f9f9f9);
+  --sh-canvas: var(--bg-primary, #ffffff);
   --sh-accent: var(--accent, #738be5);
   --sh-muted: var(--text-muted, rgba(0, 0, 0, 0.41));
 }
@@ -1509,4 +1516,248 @@ select:focus {
 @keyframes fadeInScale {
   from { opacity: 0; transform: scale(0.88); }
   to { opacity: 1; transform: scale(1); }
+}
+/* ================================================================
+   相册表盘模板库网格与卡片（WatchFaceHome）
+   版式参考商品卡：封面内嵌在卡片里、四周留出间距，
+   下方是留白充足的文字区 —— 常规字重标题靠左、圆形操作按钮靠右
+   ================================================================ */
+.tpl-grid {
+  /* 一行几列 + 列间距：手机 2 列、平板 3 列、桌面 4 列 */
+  --tpl-cols: 2;
+  --tpl-gap: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  /* 最后一行不满时（比如只剩 1 个）自动居中 */
+  justify-content: center;
+  gap: var(--tpl-gap);
+}
+.tpl-grid > * {
+  flex: 0 0 auto;
+  min-width: 0;
+  width: calc((100% - (var(--tpl-cols) - 1) * var(--tpl-gap)) / var(--tpl-cols));
+}
+@media (min-width: 640px) {
+  .tpl-grid { --tpl-cols: 3; --tpl-gap: 16px; }
+}
+@media (min-width: 768px) {
+  .tpl-grid { --tpl-cols: 4; --tpl-gap: 20px; }
+}
+@media (min-width: 1024px) {
+  .tpl-grid { --tpl-gap: 24px; }
+}
+
+.tpl-card,
+.tpl-skeleton {
+  /* 外圆角、封面与卡片边缘的间距、文字左右留白、文字区高度：真卡片与骨架共用，加载前后不跳动 */
+  --tpl-radius: 20px;
+  /* 封面四周的间距；封面内圆角 = 外圆角 − 这个间距，所以内外圆角同心 */
+  --tpl-inset: 10px;
+  --tpl-pad: 16px;
+  /* 上留白 + 按钮 36 + 下留白 */
+  --tpl-body-h: 66px;
+  --tpl-border: 1px;
+}
+.tpl-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  /* 内边距为 0：封面用 margin 让出间距，留白由封面和文字区各自控制 */
+  padding: 0;
+  border: var(--tpl-border) solid var(--border-color);
+  border-radius: var(--tpl-radius);
+  /* 兜底：封面/封面放大时的四角不会溢出卡片圆角 */
+  overflow: hidden;
+  background: var(--bg-secondary);
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    transform 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.tpl-card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-elevated);
+}
+.tpl-card:active {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-card);
+}
+.tpl-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 封面：距离卡片外沿 --tpl-inset；内圆角 = 外圆角 − 间距，两个圆角圆心重合，所以完全同心 */
+.tpl-card__cover {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  /* 卡片还有 1px 描边，减掉它才能让「描边 + 外边距」正好等于 --tpl-inset */
+  margin:
+    calc(var(--tpl-inset) - var(--tpl-border))
+    calc(var(--tpl-inset) - var(--tpl-border))
+    0;
+  border-radius: calc(var(--tpl-radius) - var(--tpl-inset));
+  overflow: hidden;
+  background: var(--bg-tertiary);
+}
+.tpl-card__cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.tpl-card:hover .tpl-card__cover img {
+  transform: scale(1.04);
+}
+.tpl-card__cover-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* 文字区：标题与圆形操作按钮一行居中，左右留白用 --tpl-pad 统一控制 */
+.tpl-card__body {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: var(--tpl-body-h);
+  padding: 0 var(--tpl-pad);
+}
+.tpl-card__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 17px;
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 圆形操作按钮：实心主题色、不带阴影；整张卡片都可点，按钮只是视觉引导 */
+.tpl-card__go {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  transition:
+    background 0.2s ease,
+    transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.tpl-card:hover .tpl-card__go {
+  background: var(--accent-hover);
+  transform: translateX(2px);
+}
+
+/* 手机：两列窄卡片，圆角 / 间距 / 留白 / 字号 / 按钮一起缩一号，标题不会被按钮挤没 */
+@media (max-width: 479px) {
+  .tpl-card,
+  .tpl-skeleton {
+    --tpl-radius: 16px;
+    --tpl-inset: 8px;
+    --tpl-pad: 14px;
+    --tpl-body-h: 58px;
+  }
+  .tpl-card__body { gap: 8px; }
+  .tpl-card__name { font-size: 15px; }
+  .tpl-card__go {
+    width: 32px;
+    height: 32px;
+  }
+}
+
+/* 封面图还没解码出来（.is-loading）以及加载骨架：先铺一层微光，避免出现空白块 */
+.tpl-card__cover.is-loading,
+.tpl-skeleton__cover {
+  background: linear-gradient(
+    100deg,
+    var(--bg-tertiary) 30%,
+    var(--bg-secondary) 50%,
+    var(--bg-tertiary) 70%
+  );
+  background-size: 300% 100%;
+  animation: tplShimmer 1.5s ease-in-out infinite;
+}
+
+/* 加载骨架：尺寸与卡片一致，加载前后不跳动 */
+.tpl-skeleton {
+  border: var(--tpl-border) solid var(--border-color);
+  border-radius: var(--tpl-radius);
+  overflow: hidden;
+  background: var(--bg-secondary);
+  box-shadow: var(--shadow-card);
+}
+.tpl-skeleton__cover {
+  aspect-ratio: 1 / 1;
+  /* 与真卡片封面同尺寸、同圆角 */
+  margin:
+    calc(var(--tpl-inset) - var(--tpl-border))
+    calc(var(--tpl-inset) - var(--tpl-border))
+    0;
+  border-radius: calc(var(--tpl-radius) - var(--tpl-inset));
+}
+.tpl-skeleton__bar {
+  display: flex;
+  align-items: center;
+  min-height: var(--tpl-body-h);
+  padding: 0 var(--tpl-pad);
+}
+.tpl-skeleton__line {
+  width: 58%;
+  height: 13px;
+  border-radius: 7px;
+  background: var(--bg-tertiary);
+}
+@keyframes tplShimmer {
+  from { background-position: 130% 0; }
+  to { background-position: -30% 0; }
+}
+
+/* 新版移动端编辑器（手环 Pro）：底部抽屉上滑出现 */
+@keyframes proSheetUp {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+/* 新版移动端编辑器（手环 Pro）：签名「排版」按钮的平滑圆角（squircle）。
+   51px 方块用普通圆角曲率会显得生硬，superellipse 让转角过渡更连续；
+   不支持 corner-shape 的浏览器会忽略这条，退回 14px 普通圆角。 */
+.pro-align-btn {
+  corner-shape: superellipse(1.8);
+}
+
+/* 签名输入框的占位文字。
+   Tailwind 的 preflight 把全局 placeholder 设成了 gray-400（#9ca3af），
+   在抽屉这块浅灰底上偏浅、几乎看不清；按设计改成 #666666。 */
+.pro-sign-textarea::placeholder {
+  color: #666666;
+}
+.pro-sign-textarea:focus::placeholder {
+  color: #666666;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tpl-card,
+  .tpl-card__cover img,
+  .tpl-card__go { transition: none; }
+  .tpl-card:hover { transform: none; }
+  .tpl-card:hover .tpl-card__cover img { transform: none; }
+  .tpl-card:hover .tpl-card__go { transform: none; }
+  .tpl-card__cover.is-loading,
+  .tpl-skeleton__cover { animation: none; }
 }

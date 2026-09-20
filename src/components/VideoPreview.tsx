@@ -1,12 +1,10 @@
 import { useCallback, useRef, useState, useEffect } from 'react'
-import { Play, Pause, Upload } from 'lucide-react'
-import { useVideoStore } from '../store/useVideoStore'
+import { Play, Pause, Upload, Eye, EyeOff } from 'lucide-react'
+import { getEffectiveCrossfadeDuration, useVideoStore } from '../store/useVideoStore'
 
 export function VideoPreview() {
   const {
     videoUrl,
-    videoFile,
-    videoElement,
     setVideoElement,
     setVideoFileAndUrl,
     cropSize,
@@ -25,6 +23,8 @@ export function VideoPreview() {
     setVideoNaturalSize,
     videoDisplaySize,
     setVideoDisplaySize,
+    crossfadeEnabled,
+    crossfadeDuration,
   } = useVideoStore()
 
   const [isPlaying, setIsPlaying] = useState(false)
@@ -36,32 +36,121 @@ export function VideoPreview() {
   const [duration, setDurationLocal] = useState(0)
   const [containerSize, setContainerSize] = useState({ width: 0, height: 0 })
   const [isDragOver, setIsDragOver] = useState(false)
+  const [showTemplate, setShowTemplate] = useState(true)
 
   const videoRef = useRef<HTMLVideoElement>(null)
+  const crossfadeVideoRef = useRef<HTMLVideoElement>(null)
   const wrapperRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const previewStageRef = useRef<HTMLDivElement>(null)
   const timelineRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const crossfadeFrameRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    const primary = videoRef.current
+    const secondary = crossfadeVideoRef.current
+    if (!primary || !secondary || !videoUrl) return
+
+    const selectionDuration = endTime - startTime
+    const fadeDuration = getEffectiveCrossfadeDuration(
+      crossfadeEnabled,
+      crossfadeDuration,
+      selectionDuration,
+    )
+    const loopStart = startTime + fadeDuration
+
+    const stopAnimation = () => {
+      if (crossfadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(crossfadeFrameRef.current)
+        crossfadeFrameRef.current = null
+      }
+      secondary.pause()
+      secondary.style.opacity = '0'
+    }
+
+    const updateCrossfade = () => {
+      if (primary.paused) {
+        stopAnimation()
+        return
+      }
+
+      const elapsed = primary.currentTime - startTime
+      if (fadeDuration > 0 && primary.currentTime >= endTime - fadeDuration) {
+        const fadeElapsed = Math.min(
+          fadeDuration,
+          Math.max(0, primary.currentTime - (endTime - fadeDuration)),
+        )
+        const expectedHeadTime = startTime + fadeElapsed
+        if (Math.abs(secondary.currentTime - expectedHeadTime) > 0.08) {
+          secondary.currentTime = expectedHeadTime
+        }
+        if (secondary.paused) void secondary.play().catch(() => undefined)
+        const progress = fadeElapsed / fadeDuration
+        const weight = progress * progress * (3 - 2 * progress)
+        secondary.style.opacity = String(weight)
+      } else {
+        secondary.pause()
+        secondary.style.opacity = '0'
+      }
+
+      if (elapsed >= selectionDuration - 0.01) {
+        primary.currentTime = loopStart
+        secondary.pause()
+        secondary.currentTime = startTime
+        secondary.style.opacity = '0'
+        void primary.play().catch(() => undefined)
+      }
+
+      crossfadeFrameRef.current = window.requestAnimationFrame(updateCrossfade)
+    }
+
+    const handlePlay = () => {
+      if (primary.currentTime < loopStart || primary.currentTime >= endTime) {
+        primary.currentTime = loopStart
+      }
+      if (crossfadeFrameRef.current === null) {
+        crossfadeFrameRef.current = window.requestAnimationFrame(updateCrossfade)
+      }
+    }
+
+    const handlePause = () => stopAnimation()
+    primary.addEventListener('play', handlePlay)
+    primary.addEventListener('pause', handlePause)
+
+    return () => {
+      primary.removeEventListener('play', handlePlay)
+      primary.removeEventListener('pause', handlePause)
+      stopAnimation()
+    }
+  }, [videoUrl, startTime, endTime, crossfadeEnabled, crossfadeDuration])
 
   useEffect(() => {
     const updateContainerSize = () => {
-      if (containerRef.current) {
+      const stage = previewStageRef.current
+      if (stage) {
         setContainerSize({
-          width: containerRef.current.clientWidth,
-          height: containerRef.current.clientHeight,
+          width: stage.clientWidth,
+          height: stage.clientHeight,
         })
       }
     }
     updateContainerSize()
-    window.addEventListener('resize', updateContainerSize)
-    return () => window.removeEventListener('resize', updateContainerSize)
-  }, [])
+    const stage = previewStageRef.current
+    if (!stage || typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateContainerSize)
+      return () => window.removeEventListener('resize', updateContainerSize)
+    }
+    const observer = new ResizeObserver(updateContainerSize)
+    observer.observe(stage)
+    return () => observer.disconnect()
+  }, [videoUrl])
 
   useEffect(() => {
     if (containerSize.width > 0 && videoNaturalSize.width > 0) {
       const videoAspect = videoNaturalSize.width / videoNaturalSize.height
-      const availableHeight = containerSize.height * 0.68
-      const availableWidth = containerSize.width
+      const availableHeight = containerSize.height * 0.9
+      const availableWidth = containerSize.width * 0.94
 
       let displayHeight = availableHeight
       let displayWidth = displayHeight * videoAspect
@@ -73,43 +162,44 @@ export function VideoPreview() {
 
       setVideoDisplaySize({ width: displayWidth, height: displayHeight })
     }
-  }, [containerSize, videoNaturalSize])
+  }, [containerSize, videoNaturalSize, setVideoDisplaySize])
 
   useEffect(() => {
     if (videoNaturalSize.width > 0) {
-      const cropPixelW = cropSize.width * cropScale
-      const cropPixelH = cropSize.height * cropScale
+      const maxScale = Math.min(
+        videoNaturalSize.width / cropSize.width,
+        videoNaturalSize.height / cropSize.height,
+      )
+      const nextScale = Math.min(cropScale, maxScale)
+      const cropPixelW = cropSize.width * nextScale
+      const cropPixelH = cropSize.height * nextScale
       const maxX = Math.max(0, videoNaturalSize.width - cropPixelW)
       const maxY = Math.max(0, videoNaturalSize.height - cropPixelH)
+      if (nextScale !== cropScale) setCropScale(nextScale)
       setCropPosition({
         x: Math.round(Math.min(cropPosition.x, maxX)),
         y: Math.round(Math.min(cropPosition.y, maxY)),
       })
     }
-  }, [videoNaturalSize, cropSize, cropScale])
+  }, [videoNaturalSize, cropSize, cropScale, cropPosition.x, cropPosition.y, setCropPosition, setCropScale, setStartTime, setVideoNaturalSize])
 
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('video/')) return
     if (videoUrl) URL.revokeObjectURL(videoUrl)
     const url = URL.createObjectURL(file)
     setVideoFileAndUrl(file, url)
+    setVideoElement(null)
     setVideoNaturalSize({ width: 0, height: 0 })
     setVideoDisplaySize({ width: 0, height: 0 })
-    setCurrentTime(0)
-    setIsPlaying(false)
-  }, [videoUrl, setVideoFileAndUrl])
-
-  const handleClearVideo = useCallback(() => {
-    if (videoUrl) URL.revokeObjectURL(videoUrl)
-    if (videoRef.current) videoRef.current.pause()
-    setVideoFileAndUrl(null, null)
-    setVideoNaturalSize({ width: 0, height: 0 })
-    setVideoDisplaySize({ width: 0, height: 0 })
-    setCurrentTime(0)
-    setIsPlaying(false)
-    setDurationLocal(0)
+    setCropScale(1)
+    setCropPosition({ x: 0, y: 0 })
+    setStartTime(0)
+    setEndTime(0)
     setDuration(0)
-  }, [videoUrl, setVideoFileAndUrl, setDuration])
+    setDurationLocal(0)
+    setCurrentTime(0)
+    setIsPlaying(false)
+  }, [videoUrl, setVideoFileAndUrl, setVideoElement, setVideoNaturalSize, setVideoDisplaySize, setCropScale, setCropPosition, setStartTime, setEndTime, setDuration])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -136,19 +226,21 @@ export function VideoPreview() {
       const dur = videoRef.current.duration
       setDurationLocal(dur)
       setDuration(dur)
+      setStartTime(0)
+      setCurrentTime(0)
+      videoRef.current.currentTime = 0
       setEndTime(Math.min(10, dur))
     }
-  }, [setVideoElement, setEndTime, setDuration])
+  }, [setVideoElement, setVideoNaturalSize, setStartTime, setEndTime, setDuration])
 
   const togglePlay = useCallback(() => {
     if (!videoRef.current) return
-    if (isPlaying) {
-      videoRef.current.pause()
+    if (videoRef.current.paused) {
+      void videoRef.current.play()
     } else {
-      videoRef.current.play()
+      videoRef.current.pause()
     }
-    setIsPlaying(!isPlaying)
-  }, [isPlaying])
+  }, [])
 
   const handleTimeUpdate = useCallback(() => {
     if (videoRef.current) {
@@ -236,7 +328,8 @@ export function VideoPreview() {
       }
 
       const maxPixelW = Math.min(videoNaturalSize.width, videoNaturalSize.height * aspectRatio)
-      newPixelW = Math.max(cropSize.width * 0.3, Math.min(maxPixelW, newPixelW))
+      const minPixelW = Math.min(cropSize.width * 0.3, maxPixelW)
+      newPixelW = Math.max(minPixelW, Math.min(maxPixelW, newPixelW))
       const newScale = newPixelW / cropSize.width
       const newPixelH = newPixelW / aspectRatio
 
@@ -256,7 +349,7 @@ export function VideoPreview() {
       setCropScale(newScale)
       setCropPosition({ x: Math.round(newX), y: Math.round(newY) })
     }
-  }, [isDragging, dragType, dragStart, stateStart, videoNaturalSize, cropSize, getCropPixelSize, setCropPosition, setCropScale, duration, startTime, endTime, setStartTime, setEndTime])
+  }, [isDragging, dragType, dragStart, stateStart, videoNaturalSize, cropSize, getCropPixelSize, setCropPosition, setCropScale, duration, setStartTime, setEndTime])
 
   const handleMouseUp = useCallback(() => {
     setIsDragging(false)
@@ -337,7 +430,13 @@ export function VideoPreview() {
     return `${minutes}:${seconds.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`
   }
 
-  const frameCount = Math.round((endTime - startTime) * fps)
+  const selectionDuration = endTime - startTime
+  const effectiveCrossfadeDuration = getEffectiveCrossfadeDuration(
+    crossfadeEnabled,
+    crossfadeDuration,
+    selectionDuration,
+  )
+  const frameCount = Math.round((selectionDuration - effectiveCrossfadeDuration) * fps)
 
   if (!videoUrl) {
     return (
@@ -413,6 +512,13 @@ export function VideoPreview() {
   const cropDisplayH = (cropPixelH / videoNaturalSize.height) * videoDisplaySize.height
   const cropDisplayX = (cropPosition.x / videoNaturalSize.width) * videoDisplaySize.width
   const cropDisplayY = (cropPosition.y / videoNaturalSize.height) * videoDisplaySize.height
+  const cropDisplayRadius = Math.min(
+    cropSize.cornerRadius * cropDisplayW / cropSize.width,
+    cropDisplayW / 2,
+    cropDisplayH / 2,
+  )
+  // 手柄中心沿圆角 45° 弧点向内收，避免圆角大时手柄飘在弧线外
+  const handleInset = cropDisplayRadius * (1 - Math.SQRT1_2)
 
   return (
     <div
@@ -424,7 +530,7 @@ export function VideoPreview() {
         border: '1px solid var(--border-color)',
       }}
     >
-      <div className="relative flex-1 flex items-center justify-center min-h-0">
+      <div ref={previewStageRef} className="relative flex-1 flex items-center justify-center min-h-0">
 
         <div
           ref={wrapperRef}
@@ -440,8 +546,22 @@ export function VideoPreview() {
             className="w-full h-full object-contain rounded-lg"
             onLoadedMetadata={handleVideoLoadedMetadata}
             onTimeUpdate={handleTimeUpdate}
+            onPlay={() => setIsPlaying(true)}
+            onPause={() => setIsPlaying(false)}
             onEnded={() => setIsPlaying(false)}
           />
+          {crossfadeEnabled && (
+            <video
+              ref={crossfadeVideoRef}
+              src={videoUrl}
+              muted
+              playsInline
+              preload="auto"
+              aria-hidden="true"
+              className="absolute inset-0 w-full h-full object-contain rounded-lg pointer-events-none"
+              style={{ opacity: 0 }}
+            />
+          )}
 
           {videoNaturalSize.width > 0 && (
             <div
@@ -451,6 +571,7 @@ export function VideoPreview() {
                 top: cropDisplayY,
                 width: cropDisplayW,
                 height: cropDisplayH,
+                borderRadius: cropDisplayRadius,
               }}
               onMouseDown={(e) => handleMouseDown(e, 'crop')}
               onTouchStart={(e) => handleMouseDown(e, 'crop')}
@@ -462,34 +583,34 @@ export function VideoPreview() {
                 <div className="absolute top-2/3 left-0 right-0 h-px bg-white/30" />
               </div>
 
-              {templateImage && (
+              {templateImage && showTemplate && (
                 <img
                   src={templateImage.src}
                   alt="模板预览"
                   className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-                  style={{ opacity: 0.4 }}
+                  style={{ opacity: 0.4, borderRadius: cropDisplayRadius }}
                 />
               )}
 
-              {/* 四角拖拽手柄 */}
+              {/* 四角拖拽手柄：沿圆角弧线内移，中心贴合圆弧 45° 点 */}
               <div
-                className="absolute -top-2.5 -left-2.5 w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-nw-resize hover:scale-110 transition-transform z-30 touch-none"
-                style={{ background: 'var(--accent)' }}
+                className="absolute w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-nw-resize hover:scale-125 transition-transform z-30 touch-none -translate-x-1/2 -translate-y-1/2"
+                style={{ background: 'var(--accent)', left: handleInset, top: handleInset }}
                 onMouseDown={(e) => handleMouseDown(e, 'tl')}
                 onTouchStart={(e) => handleMouseDown(e, 'tl')} />
               <div
-                className="absolute -top-2.5 -right-2.5 w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-ne-resize hover:scale-110 transition-transform z-30 touch-none"
-                style={{ background: 'var(--accent)' }}
+                className="absolute w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-ne-resize hover:scale-125 transition-transform z-30 touch-none translate-x-1/2 -translate-y-1/2"
+                style={{ background: 'var(--accent)', right: handleInset, top: handleInset }}
                 onMouseDown={(e) => handleMouseDown(e, 'tr')}
                 onTouchStart={(e) => handleMouseDown(e, 'tr')} />
               <div
-                className="absolute -bottom-2.5 -left-2.5 w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-sw-resize hover:scale-110 transition-transform z-30 touch-none"
-                style={{ background: 'var(--accent)' }}
+                className="absolute w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-sw-resize hover:scale-125 transition-transform z-30 touch-none -translate-x-1/2 translate-y-1/2"
+                style={{ background: 'var(--accent)', left: handleInset, bottom: handleInset }}
                 onMouseDown={(e) => handleMouseDown(e, 'bl')}
                 onTouchStart={(e) => handleMouseDown(e, 'bl')} />
               <div
-                className="absolute -bottom-2.5 -right-2.5 w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-se-resize hover:scale-110 transition-transform z-30 touch-none"
-                style={{ background: 'var(--accent)' }}
+                className="absolute w-6 h-6 md:w-5 md:h-5 border-2 border-white rounded-full cursor-se-resize hover:scale-125 transition-transform z-30 touch-none translate-x-1/2 translate-y-1/2"
+                style={{ background: 'var(--accent)', right: handleInset, bottom: handleInset }}
                 onMouseDown={(e) => handleMouseDown(e, 'br')}
                 onTouchStart={(e) => handleMouseDown(e, 'br')} />
             </div>
@@ -507,6 +628,21 @@ export function VideoPreview() {
         >
           {isPlaying ? <Pause className="w-4 h-4 md:w-6 md:h-6" /> : <Play className="w-4 h-4 md:w-6 md:h-6" />}
         </button>
+
+        {/* 模板叠加显隐切换 */}
+        {templateImage && (
+          <button
+            onClick={() => setShowTemplate((v) => !v)}
+            className="absolute bottom-2 right-2 md:bottom-4 md:right-4 p-2 md:p-3 rounded-full transition-all duration-200 z-30 hover:scale-105"
+            style={{
+              background: 'rgba(0, 0, 0, 0.5)',
+              color: showTemplate ? 'white' : 'rgba(255, 255, 255, 0.4)',
+            }}
+            title={showTemplate ? '隐藏模板叠加' : '显示模板叠加'}
+          >
+            {showTemplate ? <Eye className="w-4 h-4 md:w-6 md:h-6" /> : <EyeOff className="w-4 h-4 md:w-6 md:h-6" />}
+          </button>
+        )}
       </div>
 
       {/* 时间轴区域 */}
@@ -520,70 +656,121 @@ export function VideoPreview() {
 
         <div
           ref={timelineRef}
-          className="relative h-8 md:h-12 rounded-md cursor-pointer touch-none"
+          className="relative h-9 md:h-11 rounded-lg cursor-pointer touch-none overflow-hidden select-none"
           style={{
-            background: 'var(--bg-tertiary)',
+            background: 'var(--bg-primary)',
             border: '1px solid var(--border-color)',
+            boxShadow: 'inset 0 1px 3px rgba(0, 0, 0, 0.25)',
           }}
           onClick={handleTimelineClick}
         >
-          {/* 选区 */}
+          {crossfadeEnabled && effectiveCrossfadeDuration > 0 && duration > 0 && (
+            <>
+              <div
+                className="absolute top-0 bottom-0 z-[15] pointer-events-none"
+                style={{
+                  left: `${(startTime / duration) * 100}%`,
+                  width: `${(effectiveCrossfadeDuration / duration) * 100}%`,
+                  background: 'rgba(95, 237, 152, 0.2)',
+                  borderRight: '2px solid #5FED98',
+                }}
+              />
+              <div
+                className="absolute top-0 bottom-0 z-[15] pointer-events-none"
+                style={{
+                  left: `${((endTime - effectiveCrossfadeDuration) / duration) * 100}%`,
+                  width: `${(effectiveCrossfadeDuration / duration) * 100}%`,
+                  background: 'rgba(237, 119, 92, 0.2)',
+                  borderLeft: '2px solid #ED775C',
+                }}
+              />
+            </>
+          )}
+          {/* 未选区遮罩：左侧 */}
           <div
-            className="absolute top-0 bottom-0 z-10 cursor-grab active:cursor-grabbing rounded-lg"
+            className="absolute top-0 bottom-0 left-0 z-10 pointer-events-none"
+            style={{
+              width: `${(startTime / duration) * 100}%`,
+              background: 'rgba(0, 0, 0, 0.35)',
+            }}
+          />
+          {/* 未选区遮罩：右侧 */}
+          <div
+            className="absolute top-0 bottom-0 right-0 z-10 pointer-events-none"
+            style={{
+              width: `${((duration - endTime) / duration) * 100}%`,
+              background: 'rgba(0, 0, 0, 0.35)',
+            }}
+          />
+          {/* 选区高亮 */}
+          <div
+            className="absolute top-0 bottom-0 z-10 cursor-grab active:cursor-grabbing"
             style={{
               left: `${(startTime / duration) * 100}%`,
               width: `${((endTime - startTime) / duration) * 100}%`,
-              background: 'rgba(72, 120, 144, 0.2)',
+              background: 'rgba(72, 120, 144, 0.18)',
+              boxShadow: 'inset 0 2px 0 var(--accent), inset 0 -2px 0 var(--accent)',
             }}
             onMouseDown={handleRangeMouseDown}
             onTouchStart={handleRangeMouseDown}
           />
-          {/* 左手柄 - 绿色 */}
+          {/* 播放进度指示线 */}
           <div
-            className="absolute top-1/2 -translate-y-1/2 w-5 h-8 md:w-6 md:h-8 rounded cursor-ew-resize transition-all duration-200 z-30 touch-none hover:scale-110"
+            className="absolute top-0 bottom-0 w-0.5 z-20 pointer-events-none"
             style={{
-              left: `${(startTime / duration) * 100}%`,
+              left: `${(currentTime / duration) * 100}%`,
               transform: 'translateX(-50%)',
-              background: '#5FED98',
+              background: 'rgba(255, 255, 255, 0.9)',
+              boxShadow: '0 0 4px rgba(0,0,0,0.5)',
+            }}
+          />
+          {/* 左手柄 - 绿色抓手 */}
+          <div
+            className="absolute top-0 bottom-0 flex items-center justify-center w-4 cursor-ew-resize z-30 touch-none group"
+            style={{
+              left: `max(8px, min(calc(100% - 8px), ${(startTime / duration) * 100}%))`,
+              transform: 'translateX(-50%)',
             }}
             onMouseDown={handleLeftHandleMouseDown}
             onTouchStart={handleLeftHandleMouseDown}
-          />
-          {/* 右手柄 - 橙色 */}
+          >
+            <div
+              className="w-1.5 h-5 md:h-6 rounded-full flex flex-col items-center justify-center gap-0.5 transition-transform group-hover:scale-y-110"
+              style={{ background: '#5FED98', boxShadow: '0 0 0 1px rgba(0,0,0,0.2)' }}
+            >
+              <span className="w-px h-2 rounded-full" style={{ background: 'rgba(0,0,0,0.25)' }} />
+            </div>
+          </div>
+          {/* 右手柄 - 橙色抓手 */}
           <div
-            className="absolute top-1/2 -translate-y-1/2 w-5 h-8 md:w-6 md:h-8 rounded cursor-ew-resize transition-all duration-200 z-30 touch-none hover:scale-110"
+            className="absolute top-0 bottom-0 flex items-center justify-center w-4 cursor-ew-resize z-30 touch-none group"
             style={{
-              left: `${(endTime / duration) * 100}%`,
+              left: `max(8px, min(calc(100% - 8px), ${(endTime / duration) * 100}%))`,
               transform: 'translateX(-50%)',
-              background: '#ED775C',
             }}
             onMouseDown={handleRightHandleMouseDown}
             onTouchStart={handleRightHandleMouseDown}
-          />
-          {/* 起始时间标签 */}
-          <div
-            className="absolute top-0.5 left-0.5 px-1 py-px md:px-2 text-[9px] md:text-xs rounded-md z-40"
-            style={{
-              background: '#5FED98',
-              color: '#2D3436',
-            }}
           >
-            {formatTime(startTime)}
-          </div>
-          {/* 结束时间标签 */}
-          <div
-            className="absolute top-0.5 right-0.5 px-1 py-px md:px-2 text-[9px] md:text-xs rounded-md z-40"
-            style={{
-              background: '#ED775C',
-              color: '#fff',
-            }}
-          >
-            {formatTime(endTime)}
+            <div
+              className="w-1.5 h-5 md:h-6 rounded-full flex flex-col items-center justify-center gap-0.5 transition-transform group-hover:scale-y-110"
+              style={{ background: '#ED775C', boxShadow: '0 0 0 1px rgba(0,0,0,0.2)' }}
+            >
+              <span className="w-px h-2 rounded-full" style={{ background: 'rgba(255,255,255,0.4)' }} />
+            </div>
           </div>
         </div>
 
-        <div className="mt-1 md:mt-2 text-center text-[10px] md:text-xs" style={{ color: 'rgba(160, 160, 160, 1)' }}>
-          拖动绿色和红色标记选择要导出的视频片段
+        {/* 选区起止时间 */}
+        <div className="mt-1.5 flex items-center justify-between text-[9px] md:text-xs">
+          <span className="flex items-center gap-1" style={{ color: 'var(--text-secondary)' }}>
+            <span className="inline-block w-2 h-2 rounded-full" style={{ background: '#5FED98' }} />
+            {formatTime(startTime)}
+          </span>
+          <span style={{ color: 'var(--text-muted)' }}>拖动两端手柄或直接拖动选区</span>
+          <span className="flex items-center gap-1" style={{ color: 'var(--text-secondary)' }}>
+            {formatTime(endTime)}
+            <span className="inline-block w-2 h-2 rounded-full" style={{ background: '#ED775C' }} />
+          </span>
         </div>
 
         {videoUrl && (

@@ -1,5 +1,14 @@
-// API 基础地址，生产环境改为你的后端域名
-export const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3001'
+// API 基础地址，优先级：
+//   1. VITE_API_BASE（.env.production / .env.offline 里指定，生产与离线包用）
+//   2. 用 localhost / 127.0.0.1 打开：直连本机后端 3001
+//   3. 其它情况（手机用局域网 IP 打开、同域部署）：走同源相对路径 ''。
+//      局域网预览时手机访问的是 http://<电脑IP>:5173，同源请求由 Vite dev server
+//      的 /api 代理转发到后端，既不用给后端加 CORS 白名单，Cookie 也能正常带上。
+const configuredApiBase = import.meta.env.VITE_API_BASE as string | undefined
+const pageHostname = typeof location === 'undefined' ? '' : location.hostname
+const isLoopbackHost = /^(localhost|127\.0\.0\.1|\[::1\]|::1)$/.test(pageHostname)
+
+export const API_BASE = configuredApiBase || (isLoopbackHost ? 'http://localhost:3001' : '')
 
 async function parseJsonResponse(res: Response) {
   const text = await res.text()

@@ -11,7 +11,10 @@ export default defineConfig(({ mode }) => {
     // Capacitor WebView 需要相对路径
     base: isOffline ? './' : '/',
     build: {
-      sourcemap: isOffline ? false : 'hidden',
+      // 生产构建不输出 source map：dist 会被直接放到网站根目录，
+      // 隐藏的 .map 只是不带 sourceMappingURL 注释，文件本身仍可被下载，
+      // 等于把前端源码公开（FigmaLanding 的 map 就有 2MB+）。需要时再临时打开。
+      sourcemap: false,
       outDir: isOffline ? 'dist-offline' : 'dist',
       emptyOutDir: true,
       rollupOptions: isOffline

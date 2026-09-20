@@ -2,12 +2,12 @@ import { BrowserRouter as Router, Routes, Route, useLocation, Navigate } from "r
 import { useEffect, useState, lazy, Suspense } from "react";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { BrowserTipModal } from "@/components/BrowserTipModal";
+import { EntryNoticeModal } from "@/components/EntryNoticeModal";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 // 延迟加载工具页面，减少首页加载体积
 const Home = lazy(() => import("@/pages/Home").then(m => ({ default: m.Home })));
 const WatchFaceHome = lazy(() => import("@/pages/WatchFaceHome").then(m => ({ default: m.WatchFaceHome })));
-const WatchFaceEdit = lazy(() => import("@/pages/WatchFaceEdit").then(m => ({ default: m.WatchFaceEdit })));
-const WatchFaceEditShiYu = lazy(() => import("@/pages/WatchFaceEditShiYu").then(m => ({ default: m.WatchFaceEditShiYu })));
 const TemplateEditor = lazy(() => import("@/pages/TemplateEditor").then(m => ({ default: m.TemplateEditor })));
 const Terms = lazy(() => import("@/pages/Terms").then(m => ({ default: m.Terms })));
 const Resources = lazy(() => import("@/pages/Resources").then(m => ({ default: m.Resources })));
@@ -24,7 +24,7 @@ function PageFallback({ light = false }: { light?: boolean }) {
         justifyContent: 'center',
         alignItems: 'center',
         height: '100vh',
-        background: light ? '#f9f9f9' : 'var(--bg-primary)',
+        background: light ? '#ffffff' : 'var(--bg-primary)',
         color: light ? '#3d3d3d' : 'var(--text-primary)',
       }}
     >
@@ -54,7 +54,8 @@ function AnimatedRoutes() {
         }
       }}
     >
-      <Routes location={displayLocation}>
+      <ErrorBoundary resetKey={`${displayLocation.pathname}${displayLocation.search}`}>
+        <Routes location={displayLocation}>
         <Route path="/" element={
           <Suspense fallback={<PageFallback light />}>
             <FigmaLanding />
@@ -70,16 +71,6 @@ function AnimatedRoutes() {
         <Route path="/tools/watch-face" element={
           <Suspense fallback={<PageFallback />}>
             <WatchFaceHome />
-          </Suspense>
-        } />
-        <Route path="/tools/watch-face/edit" element={
-          <Suspense fallback={<PageFallback />}>
-            <WatchFaceEdit />
-          </Suspense>
-        } />
-        <Route path="/tools/watch-face/edit-shiyu" element={
-          <Suspense fallback={<PageFallback />}>
-            <WatchFaceEditShiYu />
           </Suspense>
         } />
         <Route path="/tools/watch-face/edit-template/:id" element={
@@ -113,6 +104,7 @@ function AnimatedRoutes() {
           </Suspense>
         } />
       </Routes>
+      </ErrorBoundary>
     </div>
   );
 }
@@ -124,6 +116,7 @@ export default function App() {
         <AnimatedRoutes />
       </Router>
       <BrowserTipModal />
+      <EntryNoticeModal />
     </ThemeProvider>
   );
 }
