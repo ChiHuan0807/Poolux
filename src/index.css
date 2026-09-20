@@ -36,6 +36,14 @@ input[type="number"] {
   }
 }
 
+/* 不认 dvh 的旧 WebView 会整条丢掉 100dvh，整页高度退化成内容高度、盖不满屏幕，
+   底部就露出系统窗口底色。用 @supports 兜底回退到 100vh：支持 dvh 的内核不会命中这条，
+   所以不会把「浏览器工具条收放」那套动态视口语义也一起丢掉（写 height:100vh;height:100dvh
+   没用，会被压缩器当成重复声明删掉前一条）。 */
+@supports not (height: 100dvh) {
+  .h-dvh { height: 100vh; }
+}
+
 /* ========== CSS 变量 — Poolux 新官网风格 ========== */
 :root {
   --bg-primary: #ffffff;

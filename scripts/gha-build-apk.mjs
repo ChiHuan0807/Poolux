@@ -33,8 +33,11 @@ function writeCapacitorConfig() {
     server: { androidScheme: 'https' },
     android: {
       allowMixedContent: true,
-      // 背景延伸到系统栏区域
-      backgroundColor: '#f9f9f9',
+      // 背景延伸到系统栏区域。
+      // 必须是白色：编辑页整页是白的（PRO_PAGE_BG），而这个色同时是 WebView 与窗口的底色。
+      // 用浅灰会在「WebView 没铺到的手势条/导航栏那一条」上留出一道灰带，
+      // 页面上看就是底部一块莫名其妙的灰色区域。
+      backgroundColor: '#ffffff',
     },
     plugins: {
       StatusBar: {
@@ -129,6 +132,15 @@ function patchAndroidStyles() {
       /(<style name="AppTheme\.NoActionBar"[^>]*>)/,
       `$1
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>`,
+    )
+  }
+  // 窗口底色（系统栏背后那一层）固定白色：部分 ROM 上 WebView 铺不到手势条区域，
+  // 那一条露出来的就是窗口底色 —— 之前的浅灰会在页面底部形成一块灰带。
+  if (!xml.includes('android:windowBackground')) {
+    xml = xml.replace(
+      /(<style name="AppTheme\.NoActionBar"[^>]*>)/,
+      `$1
+        <item name="android:windowBackground">@android:color/white</item>`,
     )
   }
   writeFileSync(stylesPath, xml)

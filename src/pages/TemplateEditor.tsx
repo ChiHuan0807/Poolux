@@ -2331,7 +2331,18 @@ export function TemplateEditor() {
      布局取自 Figma 画板：顶栏 + 预览框 + 底部三个入口 + 底部抽屉
      ═══════════════════════════════════════════════════════════ */
   if (isProUi) return (
-    <div className={`h-dvh flex flex-col overflow-hidden relative${IS_OFFLINE ? ' safe-area-pad' : ''}`} style={{ background: PRO_PAGE_BG }}>
+    // 安全区只在根节点上补一次（旧版是整块加 .safe-area-pad 类，顶栏里又算了一遍 env()，
+    // 在沉浸式 APK 上状态栏高度被算了两次，整页被顶下去；底部那 34px 也不用补：
+    // 底部入口栏自己的 paddingBottom 已经含了手势条，占位块也按实测高度留过白了）。
+    <div
+      className="h-dvh flex flex-col overflow-hidden relative"
+      style={{
+        background: PRO_PAGE_BG,
+        paddingTop: 'env(safe-area-inset-top, 0px)',
+        paddingLeft: 'env(safe-area-inset-left, 0px)',
+        paddingRight: 'env(safe-area-inset-right, 0px)',
+      }}
+    >
       <div className="flex-1 flex flex-col min-h-0 w-full mx-auto" style={{ maxWidth: 430 }}>
 
         {/* 顶栏：返回 / 模板名 / 导出。抽屉展开或预览全屏放大时整块淡出（设计稿里展开后的画板没有顶栏，
@@ -2339,7 +2350,8 @@ export function TemplateEditor() {
         <div
           className="flex-shrink-0"
           style={{
-            paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)',
+            // 状态栏的避让由根节点的 paddingTop 负责，这里只留设计稿的 16px
+            paddingTop: 16,
             opacity: activeSheet || previewExpanded ? 0 : 1,
             transition: 'opacity 0.24s ease',
             pointerEvents: activeSheet || previewExpanded ? 'none' : 'auto',
@@ -2665,7 +2677,11 @@ export function TemplateEditor() {
             aria-hidden={!activeSheet}
             style={{
               zIndex: 1,
-              transform: `translateY(${activeSheet ? 0 : sheetHeight}px)`,
+              // 收起时按自身高度的 100% 往下推，而不是用实测出来的像素值：
+              // 像素值在「刚挂载、ResizeObserver 还没回调」或安全区变化的那一帧会是旧的，
+              // 面板就露出一条浅灰边（贴在页面底部，看起来像一块莫名其妙的灰色区域）。
+              // 百分比永远等于自己当前的真实高度，收起即完全出屏。
+              transform: activeSheet ? 'translateY(0)' : 'translateY(100%)',
               transition: `transform ${PRO_SHEET_DURATION}s ${PRO_SHEET_EASING}`,
               pointerEvents: activeSheet ? 'auto' : 'none',
             }}
