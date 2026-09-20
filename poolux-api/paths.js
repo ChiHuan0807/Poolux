@@ -54,6 +54,7 @@ const usingDefaultDbFile = DB_FILE === join(DATA_DIR, 'data.db')
 if (DATA_DIR !== LEGACY_DIR) {
   const legacyDb = join(LEGACY_DIR, 'data.db')
   const legacyUploads = join(LEGACY_DIR, 'uploads')
+  const legacyJobs = join(LEGACY_DIR, 'apk-jobs')
   const log = (msg) => console.log(`[paths] ${msg}`)
 
   // 目标库不存在但旧库存在 → 自动搬运，而不是新建一个空库
@@ -83,6 +84,20 @@ if (DATA_DIR !== LEGACY_DIR) {
       console.error(
         `[paths] 复制上传文件失败：${err.message}\n` +
         `[paths] 继续启动，但图片/字体会缺失。请手动把 ${legacyUploads} 复制到 ${UPLOADS_DIR}。`,
+      )
+    }
+  }
+
+  // 已打包好的 APK 也要一起搬：数据库记录还指着 apk-jobs/<id>/ 里的文件，
+  // 只搬库不搬文件的话，后台会把历史版本显示成「已就绪」但点下载报「文件不存在」。
+  if (!existsSync(JOBS_DIR) && existsSync(legacyJobs)) {
+    try {
+      const n = copyDirRecursive(legacyJobs, JOBS_DIR)
+      log(`已把 ${n} 个 APK 打包产物从旧目录复制到 ${JOBS_DIR}`)
+    } catch (err) {
+      console.error(
+        `[paths] 复制 APK 打包产物失败：${err.message}\n` +
+        `[paths] 继续启动，但历史 APK 需要重新打包才能下载。请手动把 ${legacyJobs} 复制到 ${JOBS_DIR}。`,
       )
     }
   }

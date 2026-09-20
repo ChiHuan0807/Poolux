@@ -14,8 +14,9 @@ import { authMiddleware } from '../middleware/auth.js'
 import {
   getTemplateById, getFonts,
   createApkBuild, getApkBuildById, getLatestApkBuildByTemplate,
-  listApkBuilds, updateApkBuild,
+  listApkBuilds, updateApkBuild, getApkBuildsByTemplate,
 } from '../db.js'
+import { pruneTemplateApkVersions } from '../apk-retention.js'
 import { JOBS_DIR, UPLOADS_DIR, uploadFilePath, safeJoinWithin } from '../paths.js'
 import { hasAllowedExt, safeUploadName } from '../upload-files.js'
 import { sanitizeTemplateRow } from '../svg-safety.js'
@@ -453,12 +454,11 @@ router.post('/', authMiddleware, async (req, res) => {
 })
 
 // GET /api/apk-builds?template_id=
+// 带 template_id 时返回该模板的全部历史版本（新的在前，服务端每个模板只保留最近几个），
+// 前端取 [0] 当最新任务，并可用后面的「已就绪」版本提供上一版下载。
 router.get('/', authMiddleware, (req, res) => {
   const tid = req.query.template_id
-  if (tid) {
-    const latest = getLatestApkBuildByTemplate(Number(tid))
-    return res.json(latest ? [latest] : [])
-  }
+  if (tid) return res.json(getApkBuildsByTemplate(Number(tid)))
   res.json(listApkBuilds(100))
 })
 
@@ -506,6 +506,16 @@ router.post('/:id/complete', requireCallbackToken, apkUpload.single('file'), (re
     error: '',
     finished_at: formatChinaDateTime(),
   })
+
+  // 新版本已就绪，顺手清掉更早的版本（每个模板只留最近 APK_KEEP_VERSIONS 个）
+  try {
+    const removed = pruneTemplateApkVersions(job.template_id)
+    if (removed.length > 0) console.log('[apk] 已清理旧版本:', removed.join(', '))
+  } catch (err) {
+    // 清理失败不该影响「打包成功」这个结果
+    console.error('[apk] 清理旧版本失败:', err.message)
+  }
+
   res.json({ ok: true })
 })
 

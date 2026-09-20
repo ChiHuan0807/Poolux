@@ -1097,6 +1097,8 @@ function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => 
   const [loading, setLoading] = useState(true)
   // 每个模板最新一条打包任务
   const [apkJobs, setApkJobs] = useState<Record<number, ApkJob | null>>({})
+  // 每个模板「已就绪」的历史版本（新的在前；服务端每个模板只保留最近 2 个）
+  const [apkReady, setApkReady] = useState<Record<number, ApkJob[]>>({})
   const [apkBusy, setApkBusy] = useState<Record<number, boolean>>({})
 
   const load = useCallback(async () => {
@@ -1106,17 +1108,22 @@ function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => 
 
   const loadApkJobs = useCallback(async (list: any[]) => {
     const next: Record<number, ApkJob | null> = {}
+    const ready: Record<number, ApkJob[]> = {}
     await Promise.all(
       list.map(async (t) => {
         try {
           const rows = await apiFetch(`/api/apk-builds?template_id=${t.id}`)
-          next[t.id] = Array.isArray(rows) && rows[0] ? rows[0] : null
+          const all: ApkJob[] = Array.isArray(rows) ? rows : []
+          next[t.id] = all[0] || null
+          ready[t.id] = all.filter((j) => j.status === 'ready')
         } catch {
           next[t.id] = null
+          ready[t.id] = []
         }
       }),
     )
     setApkJobs((prev) => ({ ...prev, ...next }))
+    setApkReady((prev) => ({ ...prev, ...ready }))
   }, [])
 
   useEffect(() => { load() }, [load])
@@ -1183,12 +1190,14 @@ function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => 
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `${name || 'template'}-${job.template_id}.apk`
+      // 文件名带上构建时间，否则「最新版」和「上一版」下载下来会重名互相覆盖
+      const stamp = formatApkFinishedAt(job.finished_at).replace(/[^\d]/g, '')
+      a.download = `${name || 'template'}-${job.template_id}${stamp ? `-${stamp}` : ''}.apk`
       document.body.appendChild(a)
       a.click()
       a.remove()
       URL.revokeObjectURL(url)
-      setMsg('APK 下载已开始')
+      setMsg(`APK 下载已开始（${stamp || '未知时间'}）`)
     } catch (err: any) {
       setMsg(err.message || '下载失败')
     }
@@ -1249,6 +1258,10 @@ function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => 
         <div className="space-y-2">
           {templates.map((t: any) => {
             const job = apkJobs[t.id]
+            // 已就绪的历史版本（新的在前，服务端每个模板留最近 2 个）
+            const versions = apkReady[t.id] || []
+            const currentApk = versions[0] || null
+            const previousApk = versions[1] || null
             const busy = !!apkBusy[t.id] || !!(job && APK_BUSY.has(job.status))
             const statusText = apkStatusLabel(job)
             return (
@@ -1283,15 +1296,28 @@ function TemplateManager({ msg, setMsg }: { msg: string; setMsg: (s: string) => 
                     {busy ? '打包中' : '打包APK'}
                   </button>
                   <button
-                    onClick={() => job && handleDownloadApk(job, t.name)}
-                    disabled={!job || job.status !== 'ready'}
+                    onClick={() => currentApk && handleDownloadApk(currentApk, t.name)}
+                    disabled={!currentApk}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all disabled:opacity-40"
                     style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }}
-                    title="下载 APK"
+                    title={currentApk
+                      ? `下载 APK（构建于 ${formatApkFinishedAt(currentApk.finished_at)}）`
+                      : '暂无可下载的 APK'}
                   >
                     <Download className="w-3.5 h-3.5" />
                     下载
                   </button>
+                  {previousApk && (
+                    <button
+                      onClick={() => handleDownloadApk(previousApk, t.name)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all"
+                      style={{ background: 'var(--bg-tertiary)', color: 'var(--text-secondary)' }}
+                      title={`下载上一版（构建于 ${formatApkFinishedAt(previousApk.finished_at)}）`}
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      上一版
+                    </button>
+                  )}
                   <button onClick={() => handleEdit(t)}
                     className="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all"
                     style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}

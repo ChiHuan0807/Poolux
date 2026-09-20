@@ -621,20 +621,26 @@ export function getApkBuildById(id) {
 
 export function getApkBuildsByTemplate(templateId) {
   return db.prepare(
-    'SELECT * FROM apk_builds WHERE template_id = ? ORDER BY created_at DESC'
+    // created_at 只有秒级精度，同一秒内创建的多个任务靠 rowid 兜底，保证「新的在前」是确定顺序
+    'SELECT * FROM apk_builds WHERE template_id = ? ORDER BY created_at DESC, rowid DESC'
   ).all(templateId)
 }
 
 export function getLatestApkBuildByTemplate(templateId) {
   return db.prepare(
-    'SELECT * FROM apk_builds WHERE template_id = ? ORDER BY created_at DESC LIMIT 1'
+    'SELECT * FROM apk_builds WHERE template_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
   ).get(templateId) || null
 }
 
 export function listApkBuilds(limit = 50) {
   return db.prepare(
-    'SELECT * FROM apk_builds ORDER BY created_at DESC LIMIT ?'
+    'SELECT * FROM apk_builds ORDER BY created_at DESC, rowid DESC LIMIT ?'
   ).all(limit)
+}
+
+/** 删除任务记录（对应的 apk-jobs/<id>/ 目录由调用方自行清理） */
+export function deleteApkBuild(id) {
+  return db.prepare('DELETE FROM apk_builds WHERE id = ?').run(id)
 }
 
 export function updateApkBuild(id, data) {

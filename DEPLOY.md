@@ -103,6 +103,7 @@ POOLUX_DATA_DIR=/www/poolux-data
 3. 确认无误后，可以删掉服务器上旧的 `poolux-api/data.db`（如果它还残留的话，正常已经被搬走了）。
 
 > 如果第 4 步忘了搬（或搬了 `data.db` 但没搬 `uploads`），程序启动时发现新目录里没有 `data.db`、而 `poolux-api/data.db` 还在，会自动复制过去，日志里会打印 `[paths] 已把…复制到…`。看到这行说明是自动补救的，检查数据正常后再删掉旧副本。
+> `uploads/` 和 `apk-jobs/` 同理：新目录里没有、旧目录里还有时会自动复制过去（不然历史 APK 会显示「已就绪」却下载报「文件不存在」）。
 
 ---
 
@@ -117,6 +118,34 @@ POOLUX_DATA_DIR=/www/poolux-data
 
 > 上传前想再确认一次的话：`dist/` 里应该只有 `assets/`、`index.html`、图片、字体等前端文件，
 > 看不到 `poolux-api` 文件夹，也没有 `data.db`。
+
+---
+
+## APK 打包：产物回传到服务器，用户从本站下载
+
+后台「模板管理」点「打包APK」后的完整链路：
+
+1. 服务器把模板/字体/图标打成一个 `bundle.tar.gz`，存入 `<数据目录>/apk-jobs/<任务id>/`；
+2. 服务器调用 GitHub API 触发 Actions（`.github/workflows/build-template-apk.yml`）；
+3. Actions 拉取 bundle → 编译离线 APK → 用回调地址把 APK **POST 回服务器**；
+4. 服务器把它保存为 `<数据目录>/apk-jobs/<任务id>/template-<模板id>.apk`，任务状态变为「已就绪」。
+
+用户点「下载」时走的是本站接口 `/api/apk-builds/<任务id>/download`（需要登录），
+文件直接从服务器读取，**不再跳转到 GitHub**。旁边还有「上一版」按钮可下载倒数第二个版本。
+
+**保留几个版本**：每个模板只留最近 2 个「已就绪」的版本。
+第 3 个构建成功时，最早的那个会连同记录与文件一起自动删除（例如已有 1、2，再构建 3，就删掉 1）。
+「构建中」的任务永不清理；历史失败记录会在下一次构建成功后一并清掉。
+想改保留数量，编辑 `poolux-api/apk-retention.js` 里的 `APK_KEEP_VERSIONS` 后重新部署。
+
+**前提条件**（缺一样都会失败）：
+
+- 服务器 `.env` 里必须有 `GITHUB_TOKEN`、`GITHUB_REPO`；
+- `PUBLIC_BASE_URL` 必须是**公网可访问**的站点地址（Actions 要回来下载 bundle、并回传 APK，
+  写 `localhost` 或内网地址会导致 GitHub 那一步连不上）。
+
+**怎么确认这一版代码已生效**：打开 `https://你的域名/api/health`，
+`features` 里应出现 `apk-server-download`。
 
 ---
 

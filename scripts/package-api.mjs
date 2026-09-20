@@ -20,6 +20,7 @@ copyApi()
 // 不用猜是「代码没上传」还是「真有新 bug」。
 const FEATURES = [
   'webp-target-name', // 上传 webp 图片不再因为「转码目标名和源文件同名」而报解析失败
+  'apk-server-download', // APK 构建完回传服务器保存，用户从本站下载；每模板保留最近 2 版
 ]
 
 const buildId = new Date().toLocaleString('sv-SE').slice(0, 19)
